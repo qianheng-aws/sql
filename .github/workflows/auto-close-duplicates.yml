@@ -18,7 +18,7 @@ jobs:
         with:
           script: |
             const { owner, repo } = context.repo;
-            const THREE_DAYS_MS = 3 * 24 * 60 * 60 * 1000;
+            const GRACE_PERIOD_MS = 1 * 60 * 60 * 1000; // 1 hour (testing)
             const now = Date.now();
 
             // Find all open issues with the autoclose label
@@ -58,9 +58,9 @@ jobs:
               const lastDupeComment = dupeComments[dupeComments.length - 1];
               const dupeCommentAge = now - new Date(lastDupeComment.created_at).getTime();
 
-              if (dupeCommentAge < THREE_DAYS_MS) {
-                const daysLeft = ((THREE_DAYS_MS - dupeCommentAge) / (24 * 60 * 60 * 1000)).toFixed(1);
-                console.log(`  Duplicate comment is too recent (${daysLeft} days remaining), skipping`);
+              if (dupeCommentAge < GRACE_PERIOD_MS) {
+                const minsLeft = ((GRACE_PERIOD_MS - dupeCommentAge) / (60 * 1000)).toFixed(0);
+                console.log(`  Duplicate comment is too recent (${minsLeft} minutes remaining), skipping`);
                 continue;
               }
 
