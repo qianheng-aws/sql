@@ -38,6 +38,7 @@ import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -601,7 +602,24 @@ public class AggregateAnalyzer {
         TopHitsAggregationBuilder topHitsAggregationBuilder =
             createTopHitsBuilder(
                 aggCall, args, aggName, helper, dedupNumber, false, false, null, null);
-        yield Pair.of(topHitsAggregationBuilder, new TopHitsParser(aggName, false, false));
+        // Build rename mapping for fields whose project name differs from the original
+        // index field name. This is needed because the top_hits response uses original
+        // field names from _source, but the enumerator expects the renamed names from the
+        // logical plan's rowType. See https://github.com/opensearch-project/sql/issues/5150
+        Map<String, String> fieldRenameMapping = new HashMap<>();
+        args.stream()
+            .filter(rex -> rex.getKey() instanceof RexInputRef)
+            .forEach(
+                rex -> {
+                  String originalName = helper.inferNamedField(rex.getKey()).getRootName();
+                  String renamedName = rex.getValue();
+                  if (!originalName.equals(renamedName)) {
+                    fieldRenameMapping.put(originalName, renamedName);
+                  }
+                });
+        yield Pair.of(
+            topHitsAggregationBuilder,
+            new TopHitsParser(aggName, false, false, fieldRenameMapping));
       }
       default ->
           throw new AggregateAnalyzer.AggregateAnalyzerException(

@@ -581,4 +581,177 @@ class OpenSearchAggregationResponseParserTest {
   public Map<String, Object> entry(String name, Object value, String name2, Object value2) {
     return ImmutableMap.of(name, value, name2, value2);
   }
+
+  /**
+   * Test that TopHitsParser with fieldRenameMapping correctly renames response keys. This verifies
+   * the fix for https://github.com/opensearch-project/sql/issues/5150 where dedup pushdown
+   * aggregation returns null for renamed fields because the response uses original field names but
+   * the enumerator expects renamed names.
+   */
+  @Test
+  void top_hits_with_rename_mapping_should_remap_field_names() {
+    // Simulates: source=idx | rename value as val | dedup category | fields category, val
+    // The top_hits response uses original field name "value" from _source,
+    // but the enumerator expects "val" from the rowType.
+    String response =
+        "{\n"
+            + "  \"composite#composite_buckets\": {\n"
+            + "    \"buckets\": [\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"A\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 2,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 2, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"1\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"_source\": {\n"
+            + "                  \"category\": \"A\",\n"
+            + "                  \"value\": 10.5\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      },\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"B\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 1,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 1, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"3\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"_source\": {\n"
+            + "                  \"category\": \"B\",\n"
+            + "                  \"value\": 100.0\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "    ]\n"
+            + "  }\n"
+            + "}";
+    // With rename mapping: "value" -> "val"
+    OpenSearchAggregationResponseParser parser =
+        new CompositeAggregationParser(
+            new TopHitsParser("dedup", false, false, Map.of("value", "val")));
+    List<Map<String, Object>> result = parse(parser, response);
+    // Verify renamed field "val" appears instead of "value"
+    assertThat(
+        result,
+        contains(
+            ImmutableMap.of("category", "A"),
+            ImmutableMap.of("category", "A", "val", 10.5),
+            ImmutableMap.of("category", "B"),
+            ImmutableMap.of("category", "B", "val", 100.0)));
+  }
+
+  /**
+   * Test that TopHitsParser without rename mapping preserves original field names (backward
+   * compatibility).
+   */
+  @Test
+  void top_hits_without_rename_mapping_should_preserve_original_names() {
+    String response =
+        "{\n"
+            + "  \"composite#composite_buckets\": {\n"
+            + "    \"buckets\": [\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"A\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 1,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 1, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"1\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"_source\": {\n"
+            + "                  \"category\": \"A\",\n"
+            + "                  \"value\": 10.5\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "    ]\n"
+            + "  }\n"
+            + "}";
+    // No rename mapping
+    OpenSearchAggregationResponseParser parser =
+        new CompositeAggregationParser(new TopHitsParser("dedup", false, false));
+    List<Map<String, Object>> result = parse(parser, response);
+    // Original field name "value" should be preserved
+    assertThat(
+        result,
+        contains(
+            ImmutableMap.of("category", "A"),
+            ImmutableMap.of("category", "A", "value", 10.5)));
+  }
+
+  /**
+   * Test that TopHitsParser with multiple renames maps all fields correctly. See
+   * https://github.com/opensearch-project/sql/issues/5150
+   */
+  @Test
+  void top_hits_with_multiple_renames_should_remap_all_fields() {
+    String response =
+        "{\n"
+            + "  \"composite#composite_buckets\": {\n"
+            + "    \"buckets\": [\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"id\": 1\n"
+            + "        },\n"
+            + "        \"doc_count\": 1,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 1, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"1\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"_source\": {\n"
+            + "                  \"name\": \"Alice\",\n"
+            + "                  \"salary\": 5000\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "    ]\n"
+            + "  }\n"
+            + "}";
+    // Rename both fields: "name" -> "employee", "salary" -> "pay"
+    OpenSearchAggregationResponseParser parser =
+        new CompositeAggregationParser(
+            new TopHitsParser("dedup", false, false, Map.of("name", "employee", "salary", "pay")));
+    List<Map<String, Object>> result = parse(parser, response);
+    assertThat(
+        result,
+        contains(ImmutableMap.of("id", 1), ImmutableMap.of("employee", "Alice", "pay", 5000)));
+  }
 }

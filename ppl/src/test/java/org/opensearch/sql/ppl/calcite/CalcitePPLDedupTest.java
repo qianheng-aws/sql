@@ -229,6 +229,27 @@ public class CalcitePPLDedupTest extends CalcitePPLAbstractTest {
     verifyLogical(root, expectedLogical);
   }
 
+  /**
+   * Verify that rename + dedup on a different field produces a correct logical plan. The renamed
+   * field should appear in the plan with the renamed name, not the original. See
+   * https://github.com/opensearch-project/sql/issues/5150
+   */
+  @Test
+  public void testRenameThenDedupOnDifferentField() {
+    // rename SAL as salary, then dedup on DEPTNO -- salary should preserve the renamed name
+    String ppl = "source=EMP | rename SAL as SALARY | dedup DEPTNO | fields DEPTNO, SALARY, ENAME";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(DEPTNO=[$0], SALARY=[$1], ENAME=[$2])\n"
+            + "  LogicalFilter(condition=[<=($3, 1)])\n"
+            + "    LogicalProject(DEPTNO=[$0], SALARY=[$1], ENAME=[$2],"
+            + " _row_number_dedup_=[ROW_NUMBER() OVER (PARTITION BY $0)])\n"
+            + "      LogicalFilter(condition=[IS NOT NULL($0)])\n"
+            + "        LogicalProject(DEPTNO=[$7], SALARY=[$5], ENAME=[$1])\n"
+            + "          LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+  }
+
   @Test
   public void testRenameDedup() {
     String ppl =

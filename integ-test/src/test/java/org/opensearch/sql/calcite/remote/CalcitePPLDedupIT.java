@@ -297,6 +297,38 @@ public class CalcitePPLDedupIT extends PPLIntegTestCase {
         rows("Z", 1, "D"));
   }
 
+  /**
+   * Test rename then dedup on a different field. Renamed field should retain original values. See
+   * https://github.com/opensearch-project/sql/issues/5150
+   */
+  @Test
+  public void testRenameThenDedupOnDifferentField() throws IOException {
+    // rename name as n, then dedup on category -- n should NOT be null
+    JSONObject actual =
+        executeQuery(
+            String.format(
+                "source=%s | rename name as n | dedup category | fields category, n",
+                TEST_INDEX_DUPLICATION_NULLABLE));
+    verifySchema(actual, schema("category", null, "string"), schema("n", null, "string"));
+    verifyDataRows(actual, rows("X", "A"), rows("Y", "A"), rows("Z", "B"));
+  }
+
+  /**
+   * Test rename multiple fields then dedup on a different field. All renamed fields should retain
+   * values. See https://github.com/opensearch-project/sql/issues/5150
+   */
+  @Test
+  public void testRenameMultipleThenDedupOnDifferentField() throws IOException {
+    JSONObject actual =
+        executeQuery(
+            String.format(
+                "source=%s | rename name as n, category as cat | dedup n | fields n, cat",
+                TEST_INDEX_DUPLICATION_NULLABLE));
+    verifySchema(actual, schema("n", null, "string"), schema("cat", null, "string"));
+    verifyDataRows(
+        actual, rows("A", "X"), rows("B", "Z"), rows("C", "X"), rows("D", "Z"), rows("E", null));
+  }
+
   @Test
   public void testDedupExpr() throws IOException {
     JSONObject actual =

@@ -27,10 +27,26 @@ public class TopHitsParser implements MetricParser {
   private final boolean returnSingleValue;
   private final boolean returnMergeValue;
 
+  /**
+   * Mapping from original index field name to renamed field name. Used when dedup pushdown fetches
+   * fields by their original index names but the enumerator expects the renamed names from the
+   * logical plan's rowType. Empty map means no renaming needed.
+   */
+  private final Map<String, String> fieldRenameMapping;
+
   public TopHitsParser(String name, boolean returnSingleValue, boolean returnMergeValue) {
+    this(name, returnSingleValue, returnMergeValue, Collections.emptyMap());
+  }
+
+  public TopHitsParser(
+      String name,
+      boolean returnSingleValue,
+      boolean returnMergeValue,
+      Map<String, String> fieldRenameMapping) {
     this.name = name;
     this.returnSingleValue = returnSingleValue;
     this.returnMergeValue = returnMergeValue;
+    this.fieldRenameMapping = fieldRenameMapping;
   }
 
   @Override
@@ -129,7 +145,7 @@ public class TopHitsParser implements MetricParser {
                         ? new LinkedHashMap<>()
                         : new LinkedHashMap<>(hit.getSourceAsMap());
                 hit.getFields().values().forEach(f -> map.put(f.getName(), f.getValue()));
-                return map;
+                return applyFieldRenameMapping(map);
               })
           .toList();
     }
@@ -145,6 +161,22 @@ public class TopHitsParser implements MetricParser {
 
   private boolean isSourceEmpty(SearchHit[] hits) {
     return hits[0].getSourceAsMap() == null || hits[0].getSourceAsMap().isEmpty();
+  }
+
+  /**
+   * Apply field rename mapping to a result map. Keys that appear in the rename mapping are replaced
+   * with the renamed name so the enumerator can resolve them correctly.
+   */
+  private Map<String, Object> applyFieldRenameMapping(Map<String, Object> map) {
+    if (fieldRenameMapping.isEmpty()) {
+      return map;
+    }
+    Map<String, Object> renamed = new LinkedHashMap<>();
+    for (Map.Entry<String, Object> entry : map.entrySet()) {
+      String key = fieldRenameMapping.getOrDefault(entry.getKey(), entry.getKey());
+      renamed.put(key, entry.getValue());
+    }
+    return renamed;
   }
 
   private Object getLeafValue(Object object) {

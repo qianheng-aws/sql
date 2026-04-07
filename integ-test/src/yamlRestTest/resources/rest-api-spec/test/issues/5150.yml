@@ -1,0 +1,101 @@
+setup:
+  - do:
+      indices.create:
+        index: test_issue_5150
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              count: { type: integer }
+              category: { type: keyword }
+              subcategory: { type: keyword }
+              value: { type: double }
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+
+---
+"5150: Rename then dedup on different field should preserve renamed values":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      bulk:
+        index: test_issue_5150
+        refresh: true
+        body:
+          - '{"index": {}}'
+          - '{"count":1,"category":"A","subcategory":"X","value":10.5}'
+          - '{"index": {}}'
+          - '{"count":2,"category":"A","subcategory":"Y","value":20.3}'
+          - '{"index": {}}'
+          - '{"count":10,"category":"B","subcategory":"X","value":100.0}'
+          - '{"index": {}}'
+          - '{"count":5,"category":"C","subcategory":"Z","value":50.0}'
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5150 | rename value as val | dedup category | fields category, val | sort category
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+  # Verify val is not null (the bug would produce null for all val values)
+  - match: { datarows.0.0: "A" }
+  - is_true: datarows.0.1
+  - match: { datarows.1.0: "B" }
+  - is_true: datarows.1.1
+  - match: { datarows.2.0: "C" }
+  - is_true: datarows.2.1
+
+---
+"5150: Multiple renames then dedup should preserve all renamed values":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      bulk:
+        index: test_issue_5150
+        refresh: true
+        body:
+          - '{"index": {}}'
+          - '{"count":1,"category":"A","subcategory":"X","value":10.5}'
+          - '{"index": {}}'
+          - '{"count":2,"category":"A","subcategory":"Y","value":20.3}'
+          - '{"index": {}}'
+          - '{"count":10,"category":"B","subcategory":"X","value":100.0}'
+          - '{"index": {}}'
+          - '{"count":5,"category":"C","subcategory":"Z","value":50.0}'
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5150 | rename value as val, category as cat | dedup cat | fields cat, val | sort cat
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+  # Verify both renamed fields have values
+  - match: { datarows.0.0: "A" }
+  - is_true: datarows.0.1
+  - match: { datarows.1.0: "B" }
+  - is_true: datarows.1.1
+  - match: { datarows.2.0: "C" }
+  - is_true: datarows.2.1
