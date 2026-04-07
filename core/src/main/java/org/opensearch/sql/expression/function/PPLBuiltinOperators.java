@@ -108,6 +108,7 @@ import org.opensearch.sql.expression.function.udf.math.DivideFunction;
 import org.opensearch.sql.expression.function.udf.math.EulerFunction;
 import org.opensearch.sql.expression.function.udf.math.ModFunction;
 import org.opensearch.sql.expression.function.udf.math.NumberToStringFunction;
+import org.opensearch.sql.expression.function.udf.math.SafeArithmeticFunction;
 import org.opensearch.sql.expression.function.udf.math.ScalarMaxFunction;
 import org.opensearch.sql.expression.function.udf.math.ScalarMinFunction;
 
@@ -141,6 +142,14 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator CIDRMATCH = new CidrMatchFunction().toUDF("CIDRMATCH");
   public static final SqlOperator SCALAR_MAX = new ScalarMaxFunction().toUDF("SCALAR_MAX");
   public static final SqlOperator SCALAR_MIN = new ScalarMinFunction().toUDF("SCALAR_MIN");
+
+  // Safe arithmetic operators (overflow-checked)
+  public static final SqlOperator SAFE_ADD =
+      new SafeArithmeticFunction.SafeAddFunction().toUDF("SAFE_ADD");
+  public static final SqlOperator SAFE_SUBTRACT =
+      new SafeArithmeticFunction.SafeSubtractFunction().toUDF("SAFE_SUBTRACT");
+  public static final SqlOperator SAFE_MULTIPLY =
+      new SafeArithmeticFunction.SafeMultiplyFunction().toUDF("SAFE_MULTIPLY");
 
   public static final SqlOperator COSH =
       adaptMathFunctionToUDF(

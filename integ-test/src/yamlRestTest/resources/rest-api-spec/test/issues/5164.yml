@@ -1,0 +1,79 @@
+setup:
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+  - do:
+      indices.create:
+        index: test_overflow
+        body:
+          mappings:
+            properties:
+              int_field:
+                type: integer
+              long_field:
+                type: long
+  - do:
+      bulk:
+        index: test_overflow
+        refresh: true
+        body:
+          - '{"index": {}}'
+          - '{"int_field": 2147483647, "long_field": 9223372036854775807}'
+          - '{"index": {}}'
+          - '{"int_field": 100, "long_field": 200}'
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+
+---
+"Normal integer addition works":
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: 'source=test_overflow | where int_field = 100 | eval sum = int_field + 50 | fields int_field, sum'
+  - match: {"total": 1}
+  - match: {"datarows": [[100, 150]]}
+
+---
+"Normal long addition works":
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: 'source=test_overflow | where long_field = 200 | eval sum = long_field + 100 | fields long_field, sum'
+  - match: {"total": 1}
+  - match: {"datarows": [[200, 300]]}
+
+---
+"Integer overflow throws error":
+  - do:
+      catch: /ArithmeticException|integer overflow/
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: 'source=test_overflow | where int_field = 2147483647 | eval overflow = int_field + 1 | fields int_field, overflow'
+
+---
+"Long overflow throws error":
+  - do:
+      catch: /ArithmeticException|integer overflow/
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: 'source=test_overflow | where long_field = 9223372036854775807 | eval overflow = long_field + 1 | fields long_field, overflow'

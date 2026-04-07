@@ -280,7 +280,6 @@ import org.apache.calcite.sql.fun.SqlLibraryOperators;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.fun.SqlTrimFunction.Flag;
 import org.apache.calcite.sql.type.CompositeOperandTypeChecker;
-import org.apache.calcite.sql.type.FamilyOperandTypeChecker;
 import org.apache.calcite.sql.type.ImplicitCastOperandTypeChecker;
 import org.apache.calcite.sql.type.OperandTypes;
 import org.apache.calcite.sql.type.SameOperandTypeChecker;
@@ -726,23 +725,17 @@ public class PPLFuncImpTable {
       registerOperator(OR, SqlStdOperatorTable.OR);
       registerOperator(NOT, SqlStdOperatorTable.NOT);
 
-      // Register ADDFUNCTION for numeric addition only
-      registerOperator(ADDFUNCTION, SqlStdOperatorTable.PLUS);
-      registerOperator(
-          SUBTRACTFUNCTION,
-          SqlStdOperatorTable.MINUS,
-          PPLTypeChecker.wrapFamily((FamilyOperandTypeChecker) OperandTypes.NUMERIC_NUMERIC));
-      registerOperator(
-          SUBTRACT,
-          SqlStdOperatorTable.MINUS,
-          PPLTypeChecker.wrapFamily((FamilyOperandTypeChecker) OperandTypes.NUMERIC_NUMERIC));
+      // Register ADDFUNCTION for numeric addition only (overflow-safe)
+      registerOperator(ADDFUNCTION, PPLBuiltinOperators.SAFE_ADD);
+      registerOperator(SUBTRACTFUNCTION, PPLBuiltinOperators.SAFE_SUBTRACT);
+      registerOperator(SUBTRACT, PPLBuiltinOperators.SAFE_SUBTRACT);
       // Add DATETIME-DATETIME variant for timestamp binning support
       registerOperator(
           SUBTRACT,
           SqlStdOperatorTable.MINUS,
           PPLTypeChecker.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME));
-      registerOperator(MULTIPLY, SqlStdOperatorTable.MULTIPLY);
-      registerOperator(MULTIPLYFUNCTION, SqlStdOperatorTable.MULTIPLY);
+      registerOperator(MULTIPLY, PPLBuiltinOperators.SAFE_MULTIPLY);
+      registerOperator(MULTIPLYFUNCTION, PPLBuiltinOperators.SAFE_MULTIPLY);
       registerOperator(TRUNCATE, SqlStdOperatorTable.TRUNCATE);
       registerOperator(ASCII, SqlStdOperatorTable.ASCII);
       registerOperator(LENGTH, SqlStdOperatorTable.CHAR_LENGTH);
@@ -1096,12 +1089,8 @@ public class PPLFuncImpTable {
           ADD,
           SqlStdOperatorTable.CONCAT,
           PPLTypeChecker.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER));
-      // Register ADD (+ symbol) for numeric addition
-      // Replace type checker since PLUS also supports binary addition
-      registerOperator(
-          ADD,
-          SqlStdOperatorTable.PLUS,
-          PPLTypeChecker.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC));
+      // Register ADD (+ symbol) for numeric addition (overflow-safe)
+      registerOperator(ADD, PPLBuiltinOperators.SAFE_ADD);
       // Replace with a custom CompositeOperandTypeChecker to check both operands as
       // SqlStdOperatorTable.ITEM.getOperandTypeChecker() checks only the first
       // operand instead
