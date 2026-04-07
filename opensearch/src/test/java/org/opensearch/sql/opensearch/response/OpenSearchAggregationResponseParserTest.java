@@ -578,6 +578,123 @@ class OpenSearchAggregationResponseParserTest {
     return ImmutableMap.of(name, value);
   }
 
+  /**
+   * Tests that TopHitsParser correctly renames fields when a fieldRenameMap is provided. This is
+   * the fix for GitHub issue #5150: dedup aggregation pushdown nullifies renamed fields.
+   */
+  @Test
+  void top_hits_with_field_rename_map_should_rename_response_fields() {
+    // Simulates: source=idx | rename value as val | dedup category | fields category, val
+    // The composite bucket key uses renamed "category", and top_hits returns original "value".
+    String response =
+        "{\n"
+            + "  \"composite#composite_buckets\": {\n"
+            + "    \"buckets\": [\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"A\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 2,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 2, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"1\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"fields\": {\n"
+            + "                  \"value\": [10.5]\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      },\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"B\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 1,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 1, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"3\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"fields\": {\n"
+            + "                  \"value\": [100.0]\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "    ]\n"
+            + "  }\n"
+            + "}";
+    // TopHitsParser with fieldRenameMap: "value" -> "val"
+    OpenSearchAggregationResponseParser parser =
+        new CompositeAggregationParser(
+            new TopHitsParser("dedup", false, false, Map.of("value", "val")));
+    List<Map<String, Object>> result = parse(parser, response);
+    // Each bucket produces two maps: one for the composite key, one for the top_hits fields.
+    // The top_hits map should use "val" instead of "value".
+    assertThat(
+        result,
+        contains(
+            ImmutableMap.of("category", "A"),
+            ImmutableMap.of("val", 10.5),
+            ImmutableMap.of("category", "B"),
+            ImmutableMap.of("val", 100.0)));
+  }
+
+  /**
+   * Tests TopHitsParser without fieldRenameMap works as before (backward compatibility). Same
+   * response as above but with the default 3-arg constructor.
+   */
+  @Test
+  void top_hits_without_field_rename_map_should_use_original_field_names() {
+    String response =
+        "{\n"
+            + "  \"composite#composite_buckets\": {\n"
+            + "    \"buckets\": [\n"
+            + "      {\n"
+            + "        \"key\": {\n"
+            + "          \"category\": \"A\"\n"
+            + "        },\n"
+            + "        \"doc_count\": 1,\n"
+            + "        \"top_hits#dedup\": {\n"
+            + "          \"hits\": {\n"
+            + "            \"total\": { \"value\": 1, \"relation\": \"eq\" },\n"
+            + "            \"max_score\": 1.0,\n"
+            + "            \"hits\": [\n"
+            + "              {\n"
+            + "                \"_index\": \"idx\",\n"
+            + "                \"_id\": \"1\",\n"
+            + "                \"_score\": 1.0,\n"
+            + "                \"fields\": {\n"
+            + "                  \"value\": [10.5]\n"
+            + "                }\n"
+            + "              }\n"
+            + "            ]\n"
+            + "          }\n"
+            + "        }\n"
+            + "      }\n"
+            + "    ]\n"
+            + "  }\n"
+            + "}";
+    // TopHitsParser without fieldRenameMap (3-arg constructor)
+    OpenSearchAggregationResponseParser parser =
+        new CompositeAggregationParser(new TopHitsParser("dedup", false, false));
+    List<Map<String, Object>> result = parse(parser, response);
+    assertThat(result, contains(ImmutableMap.of("category", "A"), ImmutableMap.of("value", 10.5)));
+  }
+
   public Map<String, Object> entry(String name, Object value, String name2, Object value2) {
     return ImmutableMap.of(name, value, name2, value2);
   }

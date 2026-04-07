@@ -1,0 +1,83 @@
+setup:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+
+  - do:
+      indices.create:
+        index: issue5150
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              count:
+                type: integer
+              category:
+                type: keyword
+              subcategory:
+                type: keyword
+              value:
+                type: double
+              ts:
+                type: date
+
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - '{"index": {"_index": "issue5150", "_id": "1"}}'
+          - '{"count":1,"category":"A","subcategory":"X","value":10.5,"ts":"2024-01-01"}'
+          - '{"index": {"_index": "issue5150", "_id": "2"}}'
+          - '{"count":2,"category":"A","subcategory":"Y","value":20.3,"ts":"2024-01-02"}'
+          - '{"index": {"_index": "issue5150", "_id": "3"}}'
+          - '{"count":10,"category":"B","subcategory":"X","value":100.0,"ts":"2024-01-03"}'
+          - '{"index": {"_index": "issue5150", "_id": "4"}}'
+          - '{"count":5,"category":"C","subcategory":"Z","value":50.0,"ts":"2024-01-04"}'
+
+---
+teardown:
+  - do:
+      indices.delete:
+        index: issue5150
+        ignore_unavailable: true
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+
+---
+"Issue 5150: rename then dedup should retain renamed field values":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=issue5150 | rename value as val | dedup category | fields category, val
+
+  - match: { total: 3 }
+  - match: { schema: [ { name: category, type: string }, { name: val, type: double } ] }
+  - length: { datarows: 3 }
+
+---
+"Issue 5150: rename multiple fields then dedup should retain all renamed values":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=issue5150 | rename value as val, category as cat | dedup cat | fields cat, val
+
+  - match: { total: 3 }
+  - match: { schema: [ { name: cat, type: string }, { name: val, type: double } ] }
+  - length: { datarows: 3 }

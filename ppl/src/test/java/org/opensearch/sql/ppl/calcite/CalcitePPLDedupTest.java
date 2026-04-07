@@ -272,4 +272,32 @@ public class CalcitePPLDedupTest extends CalcitePPLAbstractTest {
             + "            LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
   }
+
+  /** Test for issue #5150: rename then dedup should produce correct logical plan. */
+  @Test
+  public void testRenameThenDedup() {
+    String ppl = "source=EMP | rename ENAME as employee | dedup DEPTNO | fields DEPTNO, employee";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(DEPTNO=[$7], employee=[$1])\n"
+            + "  LogicalFilter(condition=[<=($8, 1)])\n"
+            + "    LogicalProject(EMPNO=[$0], employee=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], _row_number_dedup_=[ROW_NUMBER() OVER (PARTITION"
+            + " BY $7)])\n"
+            + "      LogicalFilter(condition=[IS NOT NULL($7)])\n"
+            + "        LogicalProject(EMPNO=[$0], employee=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7])\n"
+            + "          LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+    String expectedSparkSql =
+        "SELECT `DEPTNO`, `employee`\n"
+            + "FROM (SELECT `EMPNO`, `employee`, `JOB`, `MGR`, `HIREDATE`, `SAL`, `COMM`,"
+            + " `DEPTNO`, ROW_NUMBER() OVER (PARTITION BY `DEPTNO`) `_row_number_dedup_`\n"
+            + "FROM (SELECT `EMPNO`, `ENAME` `employee`, `JOB`, `MGR`, `HIREDATE`, `SAL`, `COMM`,"
+            + " `DEPTNO`\n"
+            + "FROM `scott`.`EMP`) `t`\n"
+            + "WHERE `DEPTNO` IS NOT NULL) `t1`\n"
+            + "WHERE `_row_number_dedup_` <= 1";
+    verifyPPLToSparkSQL(root, expectedSparkSql);
+  }
 }

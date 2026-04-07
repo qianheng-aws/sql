@@ -27,10 +27,26 @@ public class TopHitsParser implements MetricParser {
   private final boolean returnSingleValue;
   private final boolean returnMergeValue;
 
+  /**
+   * Mapping from original index field names to renamed field names. Used when fields are renamed
+   * (e.g., via PPL rename command) before a dedup aggregation pushdown. The OpenSearch response
+   * returns original field names, but the query schema expects renamed names.
+   */
+  private final Map<String, String> fieldRenameMap;
+
   public TopHitsParser(String name, boolean returnSingleValue, boolean returnMergeValue) {
+    this(name, returnSingleValue, returnMergeValue, Collections.emptyMap());
+  }
+
+  public TopHitsParser(
+      String name,
+      boolean returnSingleValue,
+      boolean returnMergeValue,
+      Map<String, String> fieldRenameMap) {
     this.name = name;
     this.returnSingleValue = returnSingleValue;
     this.returnMergeValue = returnMergeValue;
+    this.fieldRenameMap = fieldRenameMap;
   }
 
   @Override
@@ -129,10 +145,26 @@ public class TopHitsParser implements MetricParser {
                         ? new LinkedHashMap<>()
                         : new LinkedHashMap<>(hit.getSourceAsMap());
                 hit.getFields().values().forEach(f -> map.put(f.getName(), f.getValue()));
-                return map;
+                return applyFieldRenameMap(map);
               })
           .toList();
     }
+  }
+
+  /**
+   * Apply field rename mapping to the result map. Renames keys from original index field names to
+   * their renamed aliases as expected by the query schema.
+   */
+  private Map<String, Object> applyFieldRenameMap(Map<String, Object> map) {
+    if (fieldRenameMap.isEmpty()) {
+      return map;
+    }
+    Map<String, Object> renamed = new LinkedHashMap<>();
+    for (Map.Entry<String, Object> entry : map.entrySet()) {
+      String key = fieldRenameMap.getOrDefault(entry.getKey(), entry.getKey());
+      renamed.put(key, entry.getValue());
+    }
+    return renamed;
   }
 
   private boolean isEmptyHits(SearchHit[] hits) {

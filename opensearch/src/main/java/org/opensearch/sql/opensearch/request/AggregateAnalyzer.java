@@ -38,6 +38,7 @@ import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -601,7 +602,21 @@ public class AggregateAnalyzer {
         TopHitsAggregationBuilder topHitsAggregationBuilder =
             createTopHitsBuilder(
                 aggCall, args, aggName, helper, dedupNumber, false, false, null, null);
-        yield Pair.of(topHitsAggregationBuilder, new TopHitsParser(aggName, false, false));
+        // Build rename mapping: original index field name -> renamed project field name.
+        // This is needed because the OpenSearch response uses original field names in
+        // top_hits _source/fields, but the query schema expects renamed field names.
+        Map<String, String> fieldRenameMap = new HashMap<>();
+        for (Pair<RexNode, String> arg : args) {
+          if (arg.getKey() instanceof RexInputRef) {
+            String originalName = helper.inferNamedField(arg.getKey()).getRootName();
+            String renamedName = arg.getValue();
+            if (!originalName.equals(renamedName)) {
+              fieldRenameMap.put(originalName, renamedName);
+            }
+          }
+        }
+        yield Pair.of(
+            topHitsAggregationBuilder, new TopHitsParser(aggName, false, false, fieldRenameMap));
       }
       default ->
           throw new AggregateAnalyzer.AggregateAnalyzerException(
