@@ -108,6 +108,7 @@ import org.opensearch.sql.expression.function.udf.math.DivideFunction;
 import org.opensearch.sql.expression.function.udf.math.EulerFunction;
 import org.opensearch.sql.expression.function.udf.math.ModFunction;
 import org.opensearch.sql.expression.function.udf.math.NumberToStringFunction;
+import org.opensearch.sql.expression.function.udf.math.SafeArithmeticFunction;
 import org.opensearch.sql.expression.function.udf.math.ScalarMaxFunction;
 import org.opensearch.sql.expression.function.udf.math.ScalarMinFunction;
 
@@ -130,6 +131,14 @@ public class PPLBuiltinOperators extends ReflectiveSqlOperatorTable {
   public static final SqlOperator JSON_DELETE = new JsonDeleteFunctionImpl().toUDF("JSON_DELETE");
   public static final SqlOperator JSON_APPEND = new JsonAppendFunctionImpl().toUDF("JSON_APPEND");
   public static final SqlOperator JSON_EXTEND = new JsonExtendFunctionImpl().toUDF("JSON_EXTEND");
+
+  // Safe arithmetic operators (overflow-checked for integer/long types)
+  public static final SqlOperator SAFE_ADD =
+      SafeArithmeticFunction.create(SafeArithmeticFunction.Op.ADD);
+  public static final SqlOperator SAFE_SUBTRACT =
+      SafeArithmeticFunction.create(SafeArithmeticFunction.Op.SUBTRACT);
+  public static final SqlOperator SAFE_MULTIPLY =
+      SafeArithmeticFunction.create(SafeArithmeticFunction.Op.MULTIPLY);
 
   // Math functions
   public static final SqlOperator SPAN = new SpanFunction().toUDF("SPAN");

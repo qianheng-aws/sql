@@ -1,0 +1,66 @@
+setup:
+  - do:
+      indices.create:
+        index: test_issue_5164
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              int_field:
+                type: integer
+              long_field:
+                type: long
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+  - do:
+      indices.delete:
+        index: test_issue_5164
+        ignore_unavailable: true
+---
+"Integer overflow in eval should error, not wrap silently (#5164)":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      bulk:
+        index: test_issue_5164
+        refresh: true
+        body:
+          - '{"index": {}}'
+          - '{"int_field": 2147483647, "long_field": 9223372036854775807}'
+          - '{"index": {}}'
+          - '{"int_field": 100, "long_field": 200}'
+
+  # Normal arithmetic should work fine
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "source=test_issue_5164 | where int_field = 100 | eval result = int_field + 50 | fields int_field, result"
+  - match: { total: 1 }
+  - length: { datarows: 1 }
+  - match: { datarows.0.0: 100 }
+  - match: { datarows.0.1: 150 }
+
+  # Integer addition overflow should cause an error
+  - do:
+      catch: /integer overflow/
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "source=test_issue_5164 | where int_field = 2147483647 | eval overflow = int_field + 1 | fields int_field, overflow"

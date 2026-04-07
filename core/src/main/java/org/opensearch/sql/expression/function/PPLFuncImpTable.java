@@ -726,23 +726,23 @@ public class PPLFuncImpTable {
       registerOperator(OR, SqlStdOperatorTable.OR);
       registerOperator(NOT, SqlStdOperatorTable.NOT);
 
-      // Register ADDFUNCTION for numeric addition only
-      registerOperator(ADDFUNCTION, SqlStdOperatorTable.PLUS);
+      // Register ADDFUNCTION for numeric addition only (overflow-safe)
+      registerOperator(ADDFUNCTION, PPLBuiltinOperators.SAFE_ADD);
       registerOperator(
           SUBTRACTFUNCTION,
-          SqlStdOperatorTable.MINUS,
+          PPLBuiltinOperators.SAFE_SUBTRACT,
           PPLTypeChecker.wrapFamily((FamilyOperandTypeChecker) OperandTypes.NUMERIC_NUMERIC));
       registerOperator(
           SUBTRACT,
-          SqlStdOperatorTable.MINUS,
+          PPLBuiltinOperators.SAFE_SUBTRACT,
           PPLTypeChecker.wrapFamily((FamilyOperandTypeChecker) OperandTypes.NUMERIC_NUMERIC));
       // Add DATETIME-DATETIME variant for timestamp binning support
       registerOperator(
           SUBTRACT,
           SqlStdOperatorTable.MINUS,
           PPLTypeChecker.family(SqlTypeFamily.DATETIME, SqlTypeFamily.DATETIME));
-      registerOperator(MULTIPLY, SqlStdOperatorTable.MULTIPLY);
-      registerOperator(MULTIPLYFUNCTION, SqlStdOperatorTable.MULTIPLY);
+      registerOperator(MULTIPLY, PPLBuiltinOperators.SAFE_MULTIPLY);
+      registerOperator(MULTIPLYFUNCTION, PPLBuiltinOperators.SAFE_MULTIPLY);
       registerOperator(TRUNCATE, SqlStdOperatorTable.TRUNCATE);
       registerOperator(ASCII, SqlStdOperatorTable.ASCII);
       registerOperator(LENGTH, SqlStdOperatorTable.CHAR_LENGTH);
@@ -1096,11 +1096,11 @@ public class PPLFuncImpTable {
           ADD,
           SqlStdOperatorTable.CONCAT,
           PPLTypeChecker.family(SqlTypeFamily.CHARACTER, SqlTypeFamily.CHARACTER));
-      // Register ADD (+ symbol) for numeric addition
+      // Register ADD (+ symbol) for numeric addition (overflow-safe)
       // Replace type checker since PLUS also supports binary addition
       registerOperator(
           ADD,
-          SqlStdOperatorTable.PLUS,
+          PPLBuiltinOperators.SAFE_ADD,
           PPLTypeChecker.family(SqlTypeFamily.NUMERIC, SqlTypeFamily.NUMERIC));
       // Replace with a custom CompositeOperandTypeChecker to check both operands as
       // SqlStdOperatorTable.ITEM.getOperandTypeChecker() checks only the first
