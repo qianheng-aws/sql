@@ -68,6 +68,7 @@ import org.opensearch.sql.ast.expression.SpanUnit;
 import org.opensearch.sql.ast.expression.WindowBound;
 import org.opensearch.sql.ast.expression.WindowFrame;
 import org.opensearch.sql.ast.tree.Relation;
+import org.opensearch.sql.ast.tree.SPath;
 import org.opensearch.sql.ast.tree.UnresolvedPlan;
 import org.opensearch.sql.calcite.CalcitePlanContext;
 import org.opensearch.sql.expression.function.BuiltinFunctionName;
@@ -406,6 +407,43 @@ public interface PlanUtils {
           }
         };
     return node.getChild().getFirst().accept(relationVisitor, null);
+  }
+
+  /**
+   * Extract the source preamble from the main pipeline for the appendcol subsearch base.
+   * Includes the leaf Relation and any SPath nodes, preserving schema transformations
+   * (e.g., spath converts STRING columns to MAP type).
+   */
+  static UnresolvedPlan getSourcePreamble(UnresolvedPlan node) {
+    List<SPath> spathNodes = new ArrayList<>();
+    UnresolvedPlan current = (UnresolvedPlan) node.getChild().getFirst();
+    Relation relation = null;
+    while (current != null) {
+      if (current instanceof Relation r) {
+        relation = r;
+        break;
+      }
+      if (current instanceof SPath s) {
+        spathNodes.add(s);
+      }
+      List<?> children = current.getChild();
+      if (children != null && !children.isEmpty()) {
+        current = (UnresolvedPlan) children.getFirst();
+      } else {
+        break;
+      }
+    }
+    if (relation == null) {
+      return getRelation(node);
+    }
+    UnresolvedPlan result = relation;
+    for (int i = spathNodes.size() - 1; i >= 0; i--) {
+      SPath orig = spathNodes.get(i);
+      result =
+          new SPath(
+              result, orig.getInField(), orig.getOutField(), orig.getPath());
+    }
+    return result;
   }
 
   /** Similar to {@link org.apache.calcite.plan.RelOptUtil#findTable(RelNode, String) } */

@@ -22,6 +22,7 @@ import static org.opensearch.sql.calcite.utils.PlanUtils.ROW_NUMBER_COLUMN_FOR_S
 import static org.opensearch.sql.calcite.utils.PlanUtils.ROW_NUMBER_COLUMN_FOR_SUBSEARCH;
 import static org.opensearch.sql.calcite.utils.PlanUtils.getRelation;
 import static org.opensearch.sql.calcite.utils.PlanUtils.getRexCall;
+import static org.opensearch.sql.calcite.utils.PlanUtils.getSourcePreamble;
 import static org.opensearch.sql.calcite.utils.PlanUtils.transformPlanToAttachChild;
 import static org.opensearch.sql.utils.SystemIndexUtils.DATASOURCES_TABLE_NAME;
 
@@ -2435,7 +2436,7 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
         context.relBuilder.alias(mainRowNumber, ROW_NUMBER_COLUMN_FOR_MAIN));
 
     // 3. build subsearch tree (attach relation to subsearch)
-    UnresolvedPlan relation = getRelation(node);
+    UnresolvedPlan relation = getSourcePreamble(node);
     transformPlanToAttachChild(node.getSubSearch(), relation);
     // 4. resolve subsearch plan
     node.getSubSearch().accept(this, context);
