@@ -18,6 +18,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import javax.annotation.Nullable;
@@ -89,6 +90,11 @@ import org.opensearch.sql.expression.function.PPLFuncImpTable;
 @RequiredArgsConstructor
 public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalcitePlanContext> {
   private final CalciteRelNodeVisitor planVisitor;
+
+  /** Ranking window functions that are handled directly by PlanUtils.makeOver. */
+  private static final Set<BuiltinFunctionName> RANKING_WINDOW_FUNCTIONS =
+      Set.of(
+          BuiltinFunctionName.ROW_NUMBER, BuiltinFunctionName.RANK, BuiltinFunctionName.DENSE_RANK);
 
   public RexNode analyze(UnresolvedExpression unresolved, CalcitePlanContext context) {
     return unresolved.accept(this, context);
@@ -579,6 +585,18 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                   (arguments.isEmpty() || arguments.size() == 1)
                       ? Collections.emptyList()
                       : arguments.subList(1, arguments.size());
+              // Ranking window functions (ROW_NUMBER, RANK, DENSE_RANK) are handled
+              // directly by PlanUtils.makeOver and do not have aggregate registrations.
+              if (RANKING_WINDOW_FUNCTIONS.contains(functionName)) {
+                return PlanUtils.makeOver(
+                    context,
+                    functionName,
+                    field,
+                    args,
+                    partitions,
+                    List.of(),
+                    node.getWindowFrame());
+              }
               List<RexNode> nodes =
                   PPLFuncImpTable.INSTANCE.validateAggFunctionSignature(
                       functionName, field, args, context.rexBuilder);

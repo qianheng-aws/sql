@@ -91,4 +91,37 @@ public class CalcitePPLEventstatsTest extends CalcitePPLAbstractTest {
             + "FROM `scott`.`EMP`";
     verifyPPLToSparkSQL(root, expectedSparkSql);
   }
+
+  @Test
+  public void testEventstatsRowNumber() {
+    String ppl = "source=EMP | eventstats row_number() by DEPTNO";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
+            + " COMM=[$6], DEPTNO=[$7], row_number()=[ROW_NUMBER() OVER (PARTITION BY $7)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+  }
+
+  @Test
+  public void testEventstatsRank() {
+    String ppl = "source=EMP | eventstats rank() by DEPTNO";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
+            + " COMM=[$6], DEPTNO=[$7], rank()=[RANK() OVER (PARTITION BY $7)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+  }
+
+  @Test
+  public void testEventstatsDenseRank() {
+    String ppl = "source=EMP | eventstats dense_rank() by DEPTNO";
+    RelNode root = getRelNode(ppl);
+    String expectedLogical =
+        "LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4], SAL=[$5],"
+            + " COMM=[$6], DEPTNO=[$7], dense_rank()=[DENSE_RANK() OVER (PARTITION BY $7)])\n"
+            + "  LogicalTableScan(table=[[scott, EMP]])\n";
+    verifyLogical(root, expectedLogical);
+  }
 }

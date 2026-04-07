@@ -1,0 +1,103 @@
+setup:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+  - do:
+      indices.create:
+        index: bounty-types
+        body:
+          mappings:
+            properties:
+              "int_field":
+                type: integer
+              "str_field":
+                type: keyword
+  - do:
+      bulk:
+        index: bounty-types
+        refresh: true
+        body:
+          - '{"index": {"_id": "1"}}'
+          - '{"int_field": 42, "str_field": "alpha"}'
+          - '{"index": {"_id": "2"}}'
+          - '{"int_field": -1, "str_field": "alpha"}'
+          - '{"index": {"_id": "3"}}'
+          - '{"int_field": 0, "str_field": "beta"}'
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+
+---
+"eventstats row_number by partition":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=bounty-types | eventstats row_number() as rn by str_field
+
+  - match: { total: 3 }
+
+---
+"eventstats rank by partition":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=bounty-types | eventstats rank() as rnk by str_field
+
+  - match: { total: 3 }
+
+---
+"eventstats dense_rank by partition":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=bounty-types | eventstats dense_rank() as dr by str_field
+
+  - match: { total: 3 }
+
+---
+"streamstats rank by partition":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      allowed_warnings:
+        - 'Loading the fielddata on the _id field is deprecated and will be removed in future versions. If you require sorting or aggregating on this field you should also include the id in the body of your documents, and map this field as a keyword field that has [doc_values] enabled'
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=bounty-types | streamstats rank() as rnk by int_field
+
+  - match: { total: 3 }
