@@ -1,0 +1,8 @@
+{"index":{"_id":"1"}}
+{"count":1,"category":"A","subcategory":"X","value":10.5,"ts":"2024-01-01"}
+{"index":{"_id":"2"}}
+{"count":2,"category":"A","subcategory":"Y","value":20.3,"ts":"2024-01-02"}
+{"index":{"_id":"3"}}
+{"count":10,"category":"B","subcategory":"X","value":100.0,"ts":"2024-01-03"}
+{"index":{"_id":"4"}}
+{"count":null,"category":"B","subcategory":"Y","value":null,"ts":"2024-01-04"}
