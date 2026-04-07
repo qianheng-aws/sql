@@ -15,6 +15,15 @@ public class CalcitePPLAppendcolTest extends CalcitePPLAbstractTest {
     super(CalciteAssert.SchemaSpec.SCOTT_WITH_TEMPORAL);
   }
 
+  /** Regression test for https://github.com/opensearch-project/sql/issues/5186 */
+  @Test
+  public void testAppendcolSubsearchInheritsMainPipelineFields() {
+    String ppl =
+        "source=EMP | eval new_col = DEPTNO | appendcol [ stats count() as cnt by new_col ]";
+    RelNode root = getRelNode(ppl);
+    verifyResultCount(root, 14);
+  }
+
   @Test
   public void testAppendcol() {
     String ppl = "source=EMP | appendcol [ where DEPTNO = 20 ]";
@@ -59,10 +68,10 @@ public class CalcitePPLAppendcolTest extends CalcitePPLAbstractTest {
             + " SAL=[$5], COMM=[$6], DEPTNO=[$7], left_col=[$7], _row_number_main_=[ROW_NUMBER()"
             + " OVER ()])\n"
             + "      LogicalTableScan(table=[[scott, EMP]])\n"
-            + "    LogicalProject(right_col=[$8], _row_number_subsearch_=[ROW_NUMBER() OVER ()])\n"
+            + "    LogicalProject(right_col=[$9], _row_number_subsearch_=[ROW_NUMBER() OVER ()])\n"
             + "      LogicalFilter(condition=[=($7, 20)])\n"
             + "        LogicalProject(EMPNO=[$0], ENAME=[$1], JOB=[$2], MGR=[$3], HIREDATE=[$4],"
-            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], right_col=[$7])\n"
+            + " SAL=[$5], COMM=[$6], DEPTNO=[$7], left_col=[$7], right_col=[$7])\n"
             + "          LogicalTableScan(table=[[scott, EMP]])\n";
     verifyLogical(root, expectedLogical);
     verifyResultCount(root, 14);
@@ -75,7 +84,7 @@ public class CalcitePPLAppendcolTest extends CalcitePPLAbstractTest {
             + "FROM `scott`.`EMP`) `t`\n"
             + "FULL JOIN (SELECT `right_col`, ROW_NUMBER() OVER () `_row_number_subsearch_`\n"
             + "FROM (SELECT `EMPNO`, `ENAME`, `JOB`, `MGR`, `HIREDATE`, `SAL`, `COMM`, `DEPTNO`,"
-            + " `DEPTNO` `right_col`\n"
+            + " `DEPTNO` `left_col`, `DEPTNO` `right_col`\n"
             + "FROM `scott`.`EMP`) `t0`\n"
             + "WHERE `DEPTNO` = 20) `t2` ON `t`.`_row_number_main_` ="
             + " `t2`.`_row_number_subsearch_`";

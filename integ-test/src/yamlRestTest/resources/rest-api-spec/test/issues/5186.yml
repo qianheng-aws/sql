@@ -1,0 +1,55 @@
+setup:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : true
+  - do:
+      indices.create:
+        index: test_issue_5186
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              name:
+                type: keyword
+              dept:
+                type: keyword
+              salary:
+                type: integer
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled : false
+
+---
+"appendcol subsearch should access fields from main pipeline eval (#5186)":
+  - skip:
+      features:
+        - headers
+        - allowed_warnings
+  - do:
+      bulk:
+        index: test_issue_5186
+        refresh: true
+        body:
+          - '{"index":{}}'
+          - '{"name":"Alice","dept":"eng","salary":100}'
+          - '{"index":{}}'
+          - '{"name":"Bob","dept":"eng","salary":200}'
+          - '{"index":{}}'
+          - '{"name":"Carol","dept":"sales","salary":150}'
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: "source=test_issue_5186 | eval team = dept | appendcol [ stats count() as cnt by team ] | fields name, team, cnt | sort name"
+  - match: { total: 3 }
+  - length: { datarows: 3 }

@@ -22,7 +22,6 @@ import static org.opensearch.sql.calcite.utils.PlanUtils.ROW_NUMBER_COLUMN_FOR_S
 import static org.opensearch.sql.calcite.utils.PlanUtils.ROW_NUMBER_COLUMN_FOR_SUBSEARCH;
 import static org.opensearch.sql.calcite.utils.PlanUtils.getRelation;
 import static org.opensearch.sql.calcite.utils.PlanUtils.getRexCall;
-import static org.opensearch.sql.calcite.utils.PlanUtils.transformPlanToAttachChild;
 import static org.opensearch.sql.utils.SystemIndexUtils.DATASOURCES_TABLE_NAME;
 
 import com.google.common.base.Strings;
@@ -2434,9 +2433,13 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
     context.relBuilder.projectPlus(
         context.relBuilder.alias(mainRowNumber, ROW_NUMBER_COLUMN_FOR_MAIN));
 
-    // 3. build subsearch tree (attach relation to subsearch)
-    UnresolvedPlan relation = getRelation(node);
-    transformPlanToAttachChild(node.getSubSearch(), relation);
+    // 3. Build subsearch source: start from the raw Relation, then replay any
+    //    schema-expanding commands (eval, spath, parse) from the main pipeline.
+    //    This allows the subsearch to reference fields created by those commands
+    //    (e.g. spath converting STRING to MAP) while still accessing raw columns.
+    //    See https://github.com/opensearch-project/sql/issues/5186
+    UnresolvedPlan subsearchSource = buildSubsearchSource(node);
+    PlanUtils.transformPlanToAttachChild(node.getSubSearch(), subsearchSource);
     // 4. resolve subsearch plan
     node.getSubSearch().accept(this, context);
     // 5. add row_number() column to subsearch
@@ -2526,6 +2529,59 @@ public class CalciteRelNodeVisitor extends AbstractNodeVisitor<RelNode, CalciteP
       context.relBuilder.project(finalProjections, finalFieldNames);
       return context.relBuilder.peek();
     }
+  }
+
+  /**
+   * Build the subsearch source for appendcol by walking the main pipeline's AST tree from AppendCol
+   * down to Relation. Schema-expanding commands (Eval, SPath) are collected and replayed on top of
+   * the raw Relation so the subsearch can reference fields created by those commands while still
+   * accessing raw data columns.
+   *
+   * <p>See https://github.com/opensearch-project/sql/issues/5186
+   */
+  private UnresolvedPlan buildSubsearchSource(AppendCol node) {
+    // Walk the main plan tree to collect schema-expanding commands
+    List<UnresolvedPlan> schemaExpanders = new ArrayList<>();
+    UnresolvedPlan current = node;
+    while (!current.getChild().isEmpty()) {
+      UnresolvedPlan child = (UnresolvedPlan) current.getChild().get(0);
+      if (child instanceof Eval || child instanceof SPath) {
+        schemaExpanders.add(child);
+      }
+      if (child instanceof Relation) {
+        break;
+      }
+      current = child;
+    }
+
+    // Get the raw Relation (leaf node)
+    UnresolvedPlan relation = getRelation(node);
+
+    if (schemaExpanders.isEmpty()) {
+      // No schema-expanding commands; use the raw Relation as before
+      return relation;
+    }
+
+    // Clone and chain: relation -> eval1 -> eval2 -> ...
+    // We build from the bottom up: start with the Relation, then wrap each
+    // schema-expanding command around it (in reverse order since we collected
+    // them top-down).
+    UnresolvedPlan result = relation;
+    for (int i = schemaExpanders.size() - 1; i >= 0; i--) {
+      UnresolvedPlan expander = schemaExpanders.get(i);
+      if (expander instanceof Eval evalNode) {
+        // Create a new Eval node with the same expression list but fresh child
+        Eval clone = new Eval(evalNode.getExpressionList());
+        clone.attach(result);
+        result = clone;
+      } else if (expander instanceof SPath spathNode) {
+        // SPath rewrites to Eval, so clone via rewriteAsEval
+        Eval evalFromSpath = spathNode.rewriteAsEval();
+        evalFromSpath.attach(result);
+        result = evalFromSpath;
+      }
+    }
+    return result;
   }
 
   @Override
