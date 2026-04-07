@@ -1,0 +1,104 @@
+setup:
+  - do:
+      indices.create:
+        index: test_issue_5168
+        body:
+          settings:
+            number_of_shards: 1
+            number_of_replicas: 0
+          mappings:
+            properties:
+              int_field:
+                type: integer
+              str_field:
+                type: keyword
+
+  - do:
+      bulk:
+        refresh: true
+        body:
+          - '{"index": {"_index": "test_issue_5168", "_id": "1"}}'
+          - '{"int_field": 42, "str_field": "alpha"}'
+          - '{"index": {"_index": "test_issue_5168", "_id": "2"}}'
+          - '{"int_field": -1, "str_field": "alpha"}'
+          - '{"index": {"_index": "test_issue_5168", "_id": "3"}}'
+          - '{"int_field": 0, "str_field": "beta"}'
+
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: true
+
+---
+teardown:
+  - do:
+      query.settings:
+        body:
+          transient:
+            plugins.calcite.enabled: false
+
+  - do:
+      indices.delete:
+        index: test_issue_5168
+        ignore_unavailable: true
+
+---
+"Issue 5168: eventstats row_number by partition should succeed":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5168 | eventstats row_number() by str_field
+
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+
+---
+"Issue 5168: eventstats rank by partition should succeed":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5168 | eventstats rank() by str_field
+
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+
+---
+"Issue 5168: eventstats dense_rank by partition should succeed":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5168 | eventstats dense_rank() by str_field
+
+  - match: { total: 3 }
+  - length: { datarows: 3 }
+
+---
+"Issue 5168: streamstats rank by partition should succeed":
+  - skip:
+      features:
+        - headers
+  - do:
+      headers:
+        Content-Type: 'application/json'
+      ppl:
+        body:
+          query: source=test_issue_5168 | streamstats rank() by str_field
+
+  - match: { total: 3 }
+  - length: { datarows: 3 }

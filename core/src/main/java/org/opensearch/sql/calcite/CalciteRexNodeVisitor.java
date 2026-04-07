@@ -579,6 +579,18 @@ public class CalciteRexNodeVisitor extends AbstractNodeVisitor<RexNode, CalciteP
                   (arguments.isEmpty() || arguments.size() == 1)
                       ? Collections.emptyList()
                       : arguments.subList(1, arguments.size());
+              // No-arg ranking functions (row_number, rank, dense_rank) bypass
+              // aggregate signature validation since they have no field arguments.
+              if (field == null && args.isEmpty()) {
+                return PlanUtils.makeOver(
+                    context,
+                    functionName,
+                    null,
+                    args,
+                    partitions,
+                    List.of(),
+                    node.getWindowFrame());
+              }
               List<RexNode> nodes =
                   PPLFuncImpTable.INSTANCE.validateAggFunctionSignature(
                       functionName, field, args, context.rexBuilder);
