@@ -20,6 +20,8 @@ import lombok.RequiredArgsConstructor;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.schema.Statistic;
+import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.util.CompositeMap;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.sql.calcite.plan.AbstractOpenSearchTable;
@@ -41,6 +43,8 @@ import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexReque
 import org.opensearch.sql.opensearch.storage.scan.CalciteLogicalIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScanBuilder;
+import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatisticProvider;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalAD;
 import org.opensearch.sql.planner.logical.LogicalEval;
@@ -93,6 +97,9 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
 
   /** The cached max result window setting of index. */
   private Integer cachedMaxResultWindow = null;
+
+  /** The cached Calcite Statistic for this index. */
+  private Statistic cachedStatistic = null;
 
   /** Constructor. */
   public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName) {
@@ -198,6 +205,29 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
           new OpenSearchDescribeIndexRequest(client, indexName).getMaxResultWindow();
     }
     return cachedMaxResultWindow;
+  }
+
+  @Override
+  public Statistic getStatistic() {
+    if (cachedStatistic != null) {
+      return cachedStatistic;
+    }
+    if (!Boolean.TRUE.equals(
+        settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED))) {
+      return Statistics.UNKNOWN;
+    }
+    Optional<NodeClient> nc = client.getNodeClient();
+    if (nc.isEmpty()) {
+      return Statistics.UNKNOWN;
+    }
+    IndexInsightStatisticProvider provider = new IndexInsightStatisticProvider(nc.get());
+    long docCount = getMaxResultWindow().longValue();
+    IndexInsightStatistic stat = provider.getStatistic(indexName.getIndexNames()[0], docCount);
+    if (stat != null) {
+      cachedStatistic = stat;
+      return stat;
+    }
+    return Statistics.UNKNOWN;
   }
 
   public Integer getQueryBucketSize() {

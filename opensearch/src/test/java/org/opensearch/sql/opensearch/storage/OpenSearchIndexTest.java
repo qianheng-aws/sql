@@ -13,6 +13,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.verify;
@@ -29,10 +31,13 @@ import static org.opensearch.sql.planner.logical.LogicalPlanDSL.rename;
 import static org.opensearch.sql.planner.logical.LogicalPlanDSL.sort;
 
 import com.google.common.collect.ImmutableMap;
+import java.time.Instant;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
+import org.apache.calcite.schema.Statistic;
+import org.apache.calcite.schema.Statistics;
 import org.apache.commons.lang3.tuple.ImmutablePair;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.BeforeEach;
@@ -42,6 +47,12 @@ import org.mockito.Mock;
 import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.ml.common.indexInsight.IndexInsight;
+import org.opensearch.ml.common.indexInsight.IndexInsightTaskStatus;
+import org.opensearch.ml.common.indexInsight.MLIndexInsightType;
+import org.opensearch.ml.common.transport.indexInsight.MLIndexInsightGetAction;
+import org.opensearch.ml.common.transport.indexInsight.MLIndexInsightGetResponse;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -57,6 +68,7 @@ import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
+import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanDSL;
 import org.opensearch.sql.planner.physical.PhysicalPlanDSL;
@@ -278,5 +290,53 @@ class OpenSearchIndexTest {
         .thenReturn(false);
     assertTrue(index.isFieldTypeTolerance());
     assertFalse(index.isFieldTypeTolerance());
+  }
+
+  @Test
+  void getStatistic_whenInsightEnabled_returnsIndexInsightStatistic() {
+    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(true);
+    NodeClient nodeClient = Mockito.mock(NodeClient.class);
+    when(client.getNodeClient()).thenReturn(Optional.of(nodeClient));
+    when(client.getIndexMaxResultWindows("test")).thenReturn(Map.of("test", 10000));
+
+    String content =
+        "{\"important_column_and_distribution\": {\"status\": "
+            + "{\"type\": \"keyword\", \"unique_count\": 5}}}";
+    IndexInsight insight =
+        IndexInsight.builder()
+            .index("test")
+            .content(content)
+            .status(IndexInsightTaskStatus.COMPLETED)
+            .taskType(MLIndexInsightType.STATISTICAL_DATA)
+            .lastUpdatedTime(Instant.now())
+            .build();
+    MLIndexInsightGetResponse response =
+        MLIndexInsightGetResponse.builder().indexInsight(insight).build();
+    doAnswer(
+            invocation -> {
+              ActionListener<MLIndexInsightGetResponse> listener = invocation.getArgument(2);
+              listener.onResponse(response);
+              return null;
+            })
+        .when(nodeClient)
+        .execute(eq(MLIndexInsightGetAction.INSTANCE), any(), any());
+
+    Statistic stat = index.getStatistic();
+    assertTrue(stat instanceof IndexInsightStatistic);
+  }
+
+  @Test
+  void getStatistic_whenInsightDisabled_returnsUnknown() {
+    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(false);
+    Statistic stat = index.getStatistic();
+    assertEquals(Statistics.UNKNOWN, stat);
+  }
+
+  @Test
+  void getStatistic_whenNodeClientAbsent_returnsUnknown() {
+    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.empty());
+    Statistic stat = index.getStatistic();
+    assertEquals(Statistics.UNKNOWN, stat);
   }
 }
