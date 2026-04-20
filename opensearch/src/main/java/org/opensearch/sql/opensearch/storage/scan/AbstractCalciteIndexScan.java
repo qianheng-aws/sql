@@ -41,6 +41,7 @@ import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.util.NumberUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -68,6 +69,7 @@ import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
 import org.opensearch.sql.opensearch.storage.scan.context.RareTopDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.SortExprDigest;
+import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
 
 /** An abstract relational operator representing a scan of an OpenSearchIndex type. */
 @Getter
@@ -119,6 +121,19 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
+   * Get the baseline row count for cost estimation. Uses {@link
+   * IndexInsightStatistic#getRowCount()} when available (via Index Insight), otherwise falls back
+   * to {@code osIndex.getMaxResultWindow()}.
+   */
+  private double getBaselineRowCount() {
+    Statistic stat = osIndex.getStatistic();
+    if (stat instanceof IndexInsightStatistic insightStat) {
+      return insightStat.getRowCount();
+    }
+    return osIndex.getMaxResultWindow().doubleValue();
+  }
+
+  /**
    * Compute the final row count of the scan operator with the given push down operations.
    *
    * <p>The calculation logic tries to follow the same logic in Calcite.
@@ -127,7 +142,7 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   public double estimateRowCount(RelMetadataQuery mq) {
     return pushDownContext.stream()
         .reduce(
-            osIndex.getMaxResultWindow().doubleValue(),
+            getBaselineRowCount(),
             (rowCount, operation) ->
                 switch (operation.type()) {
                   case AGGREGATION -> mq.getRowCount((RelNode) operation.digest());
@@ -170,7 +185,7 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
    */
   @Override
   public @Nullable RelOptCost computeSelfCost(RelOptPlanner planner, RelMetadataQuery mq) {
-    double dRows = osIndex.getMaxResultWindow().doubleValue(), dCpu = 0.0d;
+    double dRows = getBaselineRowCount(), dCpu = 0.0d;
     for (PushDownOperation operation : pushDownContext) {
       switch (operation.type()) {
         case AGGREGATION -> {

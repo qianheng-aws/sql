@@ -35,6 +35,7 @@ import org.apache.calcite.rel.type.RelDataTypeFieldImpl;
 import org.apache.calcite.rel.type.RelDataTypeSystem;
 import org.apache.calcite.rex.RexBuilder;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.sql.fun.SqlStdOperatorTable;
 import org.apache.calcite.sql.type.SqlTypeFactoryImpl;
 import org.apache.calcite.sql.type.SqlTypeName;
@@ -53,6 +54,7 @@ import org.opensearch.sql.opensearch.storage.scan.context.LimitDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.OSRequestBuilderAction;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
+import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
 
 @ExtendWith(MockitoExtension.class)
 public class CalciteIndexScanCostTest {
@@ -70,14 +72,17 @@ public class CalciteIndexScanCostTest {
   void setUp() {
     RelTraitSet traitSet = mock(RelTraitSet.class);
     when(cluster.traitSetOf(any(Convention.class))).thenReturn(traitSet);
-    when(osIndex.getMaxResultWindow()).thenReturn(10000);
+    lenient().when(osIndex.getMaxResultWindow()).thenReturn(10000);
     Settings settings = mock(Settings.class);
-    when(settings.getSettingValue(Key.CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR)).thenReturn(0.9);
-    when(osIndex.getSettings()).thenReturn(settings);
+    lenient()
+        .when(settings.getSettingValue(Key.CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR))
+        .thenReturn(0.9);
+    lenient().when(osIndex.getSettings()).thenReturn(settings);
 
     RelOptCostFactory costFactory = mock(RelOptCostFactory.class);
-    when(planner.getCostFactory()).thenReturn(costFactory);
-    when(costFactory.makeCost(anyDouble(), anyDouble(), anyDouble()))
+    lenient().when(planner.getCostFactory()).thenReturn(costFactory);
+    lenient()
+        .when(costFactory.makeCost(anyDouble(), anyDouble(), anyDouble()))
         .thenAnswer(
             invocation -> {
               Object[] args = invocation.getArguments();
@@ -498,6 +503,51 @@ public class CalciteIndexScanCostTest {
     lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(projectDigest2.size()));
     assertEquals(
         2102.8500643730163, Objects.requireNonNull(scan.computeSelfCost(planner, mq)).getRows());
+  }
+
+  @Test
+  void test_cost_with_insight_statistic_baseline() {
+    IndexInsightStatistic insightStat =
+        IndexInsightStatistic.fromContentJson(
+            "{\"important_column_and_distribution\": {}}", 500_000L);
+    when(osIndex.getStatistic()).thenReturn(insightStat);
+
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(10));
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    // Cost should use 500,000 as baseline instead of 10,000 (maxResultWindow)
+    // non-pushdown cost = rows * fields * factor = 500,000 * 10 * 0.9 = 4,500,000
+    assertEquals(4_500_000, scan.computeSelfCost(planner, mq).getRows());
+  }
+
+  @Test
+  void test_estimateRowCount_with_insight_statistic_baseline() {
+    IndexInsightStatistic insightStat =
+        IndexInsightStatistic.fromContentJson(
+            "{\"important_column_and_distribution\": {}}", 500_000L);
+    when(osIndex.getStatistic()).thenReturn(insightStat);
+
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    assertEquals(500_000.0, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_cost_fallback_when_no_insight_statistic() {
+    // getStatistic returns default Statistics.UNKNOWN (not IndexInsightStatistic)
+    when(osIndex.getStatistic()).thenReturn(Statistics.UNKNOWN);
+
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(10));
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    // Falls back to maxResultWindow = 10,000
+    assertEquals(90_000, scan.computeSelfCost(planner, mq).getRows());
   }
 
   private static class MockFieldList extends AbstractList<RelDataTypeField> {
