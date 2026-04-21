@@ -274,7 +274,15 @@ public class TableStatisticCollector {
     long docCount = response.getHits().getTotalHits().value();
 
     Aggregations topAggs = response.getAggregations();
-    InternalSampler sampler = topAggs == null ? null : topAggs.get(SAMPLER_AGG);
+    Object rawSampler = topAggs == null ? null : topAggs.get(SAMPLER_AGG);
+    if (rawSampler != null && !(rawSampler instanceof InternalSampler)) {
+      LOG.warn(
+          "Expected sampler aggregation at '{}' but got {}",
+          SAMPLER_AGG,
+          rawSampler.getClass().getSimpleName());
+      return TableStatistic.fromFields(docCount, Collections.emptyMap());
+    }
+    InternalSampler sampler = (InternalSampler) rawSampler;
     if (sampler == null) {
       return TableStatistic.fromFields(docCount, Collections.emptyMap());
     }

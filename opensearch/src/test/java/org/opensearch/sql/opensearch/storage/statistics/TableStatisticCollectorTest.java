@@ -333,6 +333,60 @@ class TableStatisticCollectorTest {
     assertNull(latency.maxValue(), "NEGATIVE_INFINITY should map to null");
   }
 
+  @Test
+  void buildAggregationRequest_dottedFieldName_subAggNameContainsDot() {
+    // Flattened nested fields have dot-separated names ("user.name", "user.age"). We embed
+    // the flat name directly into the sub-aggregation name ("cardinality_user.name"), which
+    // OpenSearch's AggregationBuilders.cardinality/min/max accept verbatim. This test locks
+    // in that behaviour — regression-protection against someone later "sanitizing" names by
+    // replacing dots, which would silently break stats collection on nested-object indices.
+    Map<String, OpenSearchDataType> fieldTypes = new LinkedHashMap<>();
+    fieldTypes.put("user.name", OpenSearchDataType.of(MappingType.Keyword));
+    fieldTypes.put("user.age", OpenSearchDataType.of(MappingType.Integer));
+
+    SearchRequest request = collector.buildAggregationRequest("nested-idx", fieldTypes);
+    SamplerAggregationBuilder sampler =
+        (SamplerAggregationBuilder)
+            request.source().aggregations().getAggregatorFactories().iterator().next();
+    Map<String, AggregationBuilder> subs = new LinkedHashMap<>();
+    for (AggregationBuilder b : sampler.getSubAggregations()) {
+      subs.put(b.getName(), b);
+    }
+
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.name"),
+        "cardinality sub-agg name must include the dotted path");
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.age"),
+        "cardinality sub-agg name must include the dotted path");
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.MIN_PREFIX + "user.age"),
+        "min sub-agg name must include the dotted path");
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.MAX_PREFIX + "user.age"),
+        "max sub-agg name must include the dotted path");
+  }
+
+  @Test
+  void refreshAsync_emptyFieldTypes_producesDocCountOnlyStat() {
+    // Degenerate but realistic: the caller supplies no field types (e.g. the REST
+    // /analyze endpoint on an index with only skipped-type fields, or a mapping fetch
+    // that returned empty). refreshAsync must still issue a valid search and persist
+    // a TableStatistic with just the docCount populated.
+    mockGetRaw(Optional.empty());
+    mockPutStatusSuccess();
+    mockSearchSuccess(buildResponse(50L, null));
+    mockPutSuccess();
+
+    collector.refreshAsync("empty-idx", Map.of());
+
+    ArgumentCaptor<TableStatistic> captor = ArgumentCaptor.forClass(TableStatistic.class);
+    verify(storage).put(eq("empty-idx"), captor.capture(), any());
+    TableStatistic stat = captor.getValue();
+    assertEquals(50L, stat.getDocCount());
+    assertTrue(stat.getFields().isEmpty(), "no fields supplied → no field statistics");
+  }
+
   // ---- helpers ------------------------------------------------------------
 
   private SearchResponse buildResponse(long totalHits, InternalSampler sampler) {
