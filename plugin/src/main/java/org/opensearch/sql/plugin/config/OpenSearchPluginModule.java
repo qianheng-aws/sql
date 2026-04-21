@@ -31,6 +31,8 @@ import org.opensearch.sql.opensearch.executor.protector.OpenSearchExecutionProte
 import org.opensearch.sql.opensearch.monitor.OpenSearchMemoryHealthy;
 import org.opensearch.sql.opensearch.monitor.OpenSearchResourceMonitor;
 import org.opensearch.sql.opensearch.storage.OpenSearchStorageEngine;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.sql.planner.Planner;
 import org.opensearch.sql.planner.optimizer.LogicalPlanOptimizer;
 import org.opensearch.sql.ppl.PPLService;
@@ -62,8 +64,25 @@ public class OpenSearchPluginModule extends AbstractModule {
   }
 
   @Provides
-  public StorageEngine storageEngine(OpenSearchClient client, Settings settings) {
-    return new OpenSearchStorageEngine(client, settings);
+  @Singleton
+  public TableStatisticStorage tableStatisticStorage(NodeClient nodeClient) {
+    return new TableStatisticStorage(nodeClient);
+  }
+
+  @Provides
+  @Singleton
+  public TableStatisticCollector tableStatisticCollector(
+      NodeClient nodeClient, TableStatisticStorage storage) {
+    return new TableStatisticCollector(nodeClient, storage);
+  }
+
+  @Provides
+  public StorageEngine storageEngine(
+      OpenSearchClient client,
+      Settings settings,
+      TableStatisticStorage statisticStorage,
+      TableStatisticCollector statisticCollector) {
+    return new OpenSearchStorageEngine(client, settings, statisticStorage, statisticCollector);
   }
 
   @Provides
