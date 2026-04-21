@@ -70,10 +70,33 @@ public class RestTableStatisticsAction extends BaseRestHandler {
           channel.sendResponse(
               new BytesRestResponse(RestStatus.BAD_REQUEST, "Missing {index} path parameter"));
     }
+    String validationError = validateConcreteIndexName(indexName);
+    if (validationError != null) {
+      return channel ->
+          channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, validationError));
+    }
     if (request.method() == RestRequest.Method.POST) {
       return channel -> handleAnalyze(indexName, channel);
     }
     return channel -> handleGet(indexName, channel);
+  }
+
+  /**
+   * Reject index-name path parameters that could resolve to multiple indices or otherwise surprise
+   * the caller: wildcards ({@code *}, {@code ?}), comma-separated lists, exclusion ({@code -})
+   * prefix, and date-math ({@code <}/{@code >}) are all ambiguous here because a single stored
+   * statistic doc can only describe one concrete index. Returns a human-readable error message, or
+   * {@code null} when {@code indexName} is a single concrete-looking name.
+   */
+  static String validateConcreteIndexName(String indexName) {
+    if (indexName.indexOf('*') >= 0 || indexName.indexOf('?') >= 0 || indexName.indexOf(',') >= 0) {
+      return "Wildcard and comma-separated index expressions are not supported: " + indexName;
+    }
+    char first = indexName.charAt(0);
+    if (first == '-' || first == '+' || first == '<' || first == '>') {
+      return "Index-name must be a single concrete index; got: " + indexName;
+    }
+    return null;
   }
 
   private void handleGet(String indexName, RestChannel channel) {

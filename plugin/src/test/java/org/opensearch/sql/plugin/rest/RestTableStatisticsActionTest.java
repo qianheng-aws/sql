@@ -7,11 +7,13 @@ package org.opensearch.sql.plugin.rest;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 import java.io.IOException;
@@ -155,6 +157,34 @@ public class RestTableStatisticsActionTest {
     ArgumentCaptor<RestResponse> responseCaptor = ArgumentCaptor.forClass(RestResponse.class);
     verify(channel).sendResponse(responseCaptor.capture());
     assertEquals(RestStatus.BAD_REQUEST, responseCaptor.getValue().status());
+  }
+
+  @Test
+  public void validateConcreteIndexName_acceptsConcreteNames() {
+    assertNull(RestTableStatisticsAction.validateConcreteIndexName("my-index"));
+    assertNull(RestTableStatisticsAction.validateConcreteIndexName("logs-2026.04"));
+    assertNull(RestTableStatisticsAction.validateConcreteIndexName(".internal-index"));
+  }
+
+  @Test
+  public void validateConcreteIndexName_rejectsWildcardsAndCommaList() {
+    assertNotNull(RestTableStatisticsAction.validateConcreteIndexName("logs-*"));
+    assertNotNull(RestTableStatisticsAction.validateConcreteIndexName("logs-?"));
+    assertNotNull(RestTableStatisticsAction.validateConcreteIndexName("a,b"));
+    assertNotNull(RestTableStatisticsAction.validateConcreteIndexName("-excluded"));
+    assertNotNull(RestTableStatisticsAction.validateConcreteIndexName("<date-math>"));
+  }
+
+  @Test
+  public void POST_analyze_wildcardIndex_returns400() throws Exception {
+    FakeRestRequest request = newAnalyzeRequest("logs-*");
+    RestChannel channel = new MockRestChannel(request);
+    action.handleRequest(request, channel, nodeClient);
+
+    RestResponse response = ((MockRestChannel) channel).getResponse();
+    assertEquals(RestStatus.BAD_REQUEST, response.status());
+    // Wildcard requests must NOT trigger any collector work.
+    verify(collector, never()).refreshAsync(any(), any());
   }
 
   private static FakeRestRequest newGetRequest(String index) {
