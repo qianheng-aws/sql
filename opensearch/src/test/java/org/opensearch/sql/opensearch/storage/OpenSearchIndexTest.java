@@ -294,7 +294,7 @@ class OpenSearchIndexTest {
 
   @Test
   void getStatistic_whenInsightEnabled_returnsIndexInsightStatistic() {
-    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(true);
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
     NodeClient nodeClient = Mockito.mock(NodeClient.class);
     when(client.getNodeClient()).thenReturn(Optional.of(nodeClient));
     when(client.getIndexMaxResultWindows("test")).thenReturn(Map.of("test", 10000));
@@ -327,14 +327,14 @@ class OpenSearchIndexTest {
 
   @Test
   void getStatistic_whenInsightDisabled_returnsUnknown() {
-    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(false);
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(false);
     Statistic stat = index.getStatistic();
     assertEquals(Statistics.UNKNOWN, stat);
   }
 
   @Test
   void getStatistic_whenNodeClientAbsent_returnsUnknown() {
-    when(settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED)).thenReturn(true);
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
     when(client.getNodeClient()).thenReturn(Optional.empty());
     Statistic stat = index.getStatistic();
     assertEquals(Statistics.UNKNOWN, stat);

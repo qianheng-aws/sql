@@ -186,9 +186,9 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
-  public static final Setting<?> INDEX_INSIGHT_STATISTICS_ENABLED_SETTING =
+  public static final Setting<?> TABLE_STATISTICS_ENABLED_SETTING =
       Setting.boolSetting(
-          Key.INDEX_INSIGHT_STATISTICS_ENABLED.getKeyValue(),
+          Key.TABLE_STATISTICS_ENABLED.getKeyValue(),
           false,
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
@@ -477,9 +477,9 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
-        Key.INDEX_INSIGHT_STATISTICS_ENABLED,
-        INDEX_INSIGHT_STATISTICS_ENABLED_SETTING,
-        new Updater(Key.INDEX_INSIGHT_STATISTICS_ENABLED));
+        Key.TABLE_STATISTICS_ENABLED,
+        TABLE_STATISTICS_ENABLED_SETTING,
+        new Updater(Key.TABLE_STATISTICS_ENABLED));
     register(
         settingBuilder,
         clusterSettings,
@@ -671,7 +671,7 @@ public class OpenSearchSettings extends Settings {
         .add(CALCITE_PUSHDOWN_ENABLED_SETTING)
         .add(CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR_SETTING)
         .add(CALCITE_SUPPORT_ALL_JOIN_TYPES_SETTING)
-        .add(INDEX_INSIGHT_STATISTICS_ENABLED_SETTING)
+        .add(TABLE_STATISTICS_ENABLED_SETTING)
         .add(DEFAULT_PATTERN_METHOD_SETTING)
         .add(DEFAULT_PATTERN_MODE_SETTING)
         .add(DEFAULT_PATTERN_MAX_SAMPLE_COUNT_SETTING)

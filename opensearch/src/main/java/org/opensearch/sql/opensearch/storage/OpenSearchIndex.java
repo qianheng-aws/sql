@@ -212,8 +212,7 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
     if (cachedStatistic != null) {
       return cachedStatistic;
     }
-    if (!Boolean.TRUE.equals(
-        settings.getSettingValue(Settings.Key.INDEX_INSIGHT_STATISTICS_ENABLED))) {
+    if (!Boolean.TRUE.equals(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED))) {
       return Statistics.UNKNOWN;
     }
     Optional<NodeClient> nc = client.getNodeClient();
