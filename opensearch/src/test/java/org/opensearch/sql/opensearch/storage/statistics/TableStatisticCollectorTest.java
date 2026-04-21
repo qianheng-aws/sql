@@ -1,0 +1,406 @@
+/*
+ * Copyright OpenSearch Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+package org.opensearch.sql.opensearch.storage.statistics;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Optional;
+import org.apache.lucene.search.TotalHits;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
+import org.mockito.ArgumentCaptor;
+import org.mockito.Mock;
+import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
+import org.opensearch.core.action.ActionListener;
+import org.opensearch.search.SearchHits;
+import org.opensearch.search.aggregations.AggregationBuilder;
+import org.opensearch.search.aggregations.Aggregations;
+import org.opensearch.search.aggregations.InternalAggregations;
+import org.opensearch.search.aggregations.bucket.sampler.InternalSampler;
+import org.opensearch.search.aggregations.bucket.sampler.SamplerAggregationBuilder;
+import org.opensearch.search.aggregations.metrics.InternalCardinality;
+import org.opensearch.search.aggregations.metrics.InternalMax;
+import org.opensearch.search.aggregations.metrics.InternalMin;
+import org.opensearch.search.builder.SearchSourceBuilder;
+import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
+import org.opensearch.sql.opensearch.data.type.OpenSearchDataType.MappingType;
+import org.opensearch.sql.opensearch.data.type.OpenSearchTextType;
+import org.opensearch.transport.client.node.NodeClient;
+
+@ExtendWith(MockitoExtension.class)
+class TableStatisticCollectorTest {
+
+  @Mock private NodeClient nodeClient;
+  @Mock private TableStatisticStorage storage;
+
+  private TableStatisticCollector collector;
+
+  @BeforeEach
+  void setUp() {
+    collector = new TableStatisticCollector(nodeClient, storage);
+  }
+
+  // ---- buildAggregationRequest --------------------------------------------
+
+  @Test
+  void buildAggregationRequest_addsCorrectAggregationsPerFieldType() {
+    Map<String, OpenSearchDataType> fieldTypes = new LinkedHashMap<>();
+    fieldTypes.put("status", OpenSearchDataType.of(MappingType.Keyword));
+    fieldTypes.put("latency", OpenSearchDataType.of(MappingType.Long));
+    // text with a keyword sub-field
+    Map<String, OpenSearchDataType> subKw = new LinkedHashMap<>();
+    subKw.put("keyword", OpenSearchDataType.of(MappingType.Keyword));
+    fieldTypes.put("message", OpenSearchTextType.of(subKw));
+    // text without sub-field — should be skipped entirely
+    fieldTypes.put("raw_text", OpenSearchTextType.of());
+    fieldTypes.put("@timestamp", OpenSearchDataType.of(MappingType.Date));
+    fieldTypes.put("active", OpenSearchDataType.of(MappingType.Boolean));
+    fieldTypes.put("obj", OpenSearchDataType.of(MappingType.Object));
+
+    SearchRequest request = collector.buildAggregationRequest("my-idx", fieldTypes);
+
+    // Target index
+    assertEquals(1, request.indices().length);
+    assertEquals("my-idx", request.indices()[0]);
+
+    SearchSourceBuilder source = request.source();
+    assertEquals(0, source.size(), "expected size=0");
+    assertTrue(source.trackTotalHitsUpTo() != null, "expected trackTotalHits to be set");
+
+    // Top-level aggregation is the sampler
+    assertEquals(1, source.aggregations().getAggregatorFactories().size());
+    AggregationBuilder top = source.aggregations().getAggregatorFactories().iterator().next();
+    assertTrue(
+        top instanceof SamplerAggregationBuilder,
+        "top-level aggregation should be sampler, got " + top.getClass());
+    SamplerAggregationBuilder sampler = (SamplerAggregationBuilder) top;
+    assertEquals(TableStatisticCollector.SAMPLER_AGG, sampler.getName());
+    assertEquals(100_000, sampler.shardSize());
+
+    Map<String, AggregationBuilder> subs = new LinkedHashMap<>();
+    for (AggregationBuilder sub : sampler.getSubAggregations()) {
+      subs.put(sub.getName(), sub);
+    }
+
+    // status (keyword): cardinality only
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "status"),
+        "cardinality for status");
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "status"),
+        "no min for keyword status");
+
+    // latency (long): cardinality + min + max
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "latency"),
+        "cardinality for latency");
+    assertTrue(subs.containsKey(TableStatisticCollector.MIN_PREFIX + "latency"), "min for latency");
+    assertTrue(subs.containsKey(TableStatisticCollector.MAX_PREFIX + "latency"), "max for latency");
+
+    // message (text w/ .keyword): cardinality only (on .keyword sub-field)
+    assertTrue(
+        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "message"),
+        "cardinality for message");
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "message"), "no min for text");
+
+    // raw_text (text w/o keyword sub-field): skipped
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "raw_text"),
+        "raw_text text without keyword should be skipped");
+
+    // @timestamp (date): min + max only (no cardinality)
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "@timestamp"),
+        "no cardinality for date");
+    assertTrue(subs.containsKey(TableStatisticCollector.MIN_PREFIX + "@timestamp"), "min for date");
+    assertTrue(subs.containsKey(TableStatisticCollector.MAX_PREFIX + "@timestamp"), "max for date");
+
+    // active (boolean): skipped
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "active"),
+        "boolean should be skipped");
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "active"),
+        "boolean should be skipped");
+
+    // obj (object): skipped
+    assertTrue(
+        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "obj"),
+        "object should be skipped");
+  }
+
+  // ---- refreshAsync: race protection --------------------------------------
+
+  @Test
+  void refreshAsync_whenGeneratingMarkerFresh_isNoop() {
+    // status=GENERATING, fresh (just now) — should skip
+    Map<String, Object> generating = new LinkedHashMap<>();
+    generating.put("status", TableStatistic.STATUS_GENERATING);
+    generating.put("last_updated_time", Instant.now().toString());
+    mockGetRaw(Optional.of(generating));
+
+    collector.refreshAsync("idx", Map.of("status", OpenSearchDataType.of(MappingType.Keyword)));
+
+    verify(nodeClient, never()).search(any(SearchRequest.class), any());
+    verify(storage, never()).putStatus(any(), any(), any());
+    verify(storage, never()).put(any(), any(), any());
+  }
+
+  @Test
+  void refreshAsync_whenGeneratingMarkerStale_proceeds() {
+    // status=GENERATING, but last_updated_time is >10 minutes ago → abandoned, proceed
+    Map<String, Object> generating = new LinkedHashMap<>();
+    generating.put("status", TableStatistic.STATUS_GENERATING);
+    generating.put("last_updated_time", Instant.now().minusSeconds(20 * 60).toString());
+    mockGetRaw(Optional.of(generating));
+    mockPutStatusSuccess();
+    mockSearchSuccess(buildResponse(42L, null));
+
+    collector.refreshAsync("idx", Map.of("status", OpenSearchDataType.of(MappingType.Keyword)));
+
+    verify(nodeClient).search(any(SearchRequest.class), any());
+  }
+
+  @Test
+  void refreshAsync_whenNoMarker_proceeds() {
+    mockGetRaw(Optional.empty());
+    mockPutStatusSuccess();
+    SearchResponse response = buildResponse(137L, null);
+    mockSearchSuccess(response);
+    mockPutSuccess();
+
+    Map<String, OpenSearchDataType> fieldTypes =
+        Map.of("status", OpenSearchDataType.of(MappingType.Keyword));
+
+    collector.refreshAsync("my-idx", fieldTypes);
+
+    // marker written
+    verify(storage).putStatus(eq("my-idx"), eq(TableStatistic.STATUS_GENERATING), any());
+
+    // search called with correct index
+    ArgumentCaptor<SearchRequest> reqCaptor = ArgumentCaptor.forClass(SearchRequest.class);
+    verify(nodeClient).search(reqCaptor.capture(), any());
+    assertEquals("my-idx", reqCaptor.getValue().indices()[0]);
+
+    // stat written
+    ArgumentCaptor<TableStatistic> statCaptor = ArgumentCaptor.forClass(TableStatistic.class);
+    verify(storage).put(eq("my-idx"), statCaptor.capture(), any());
+    assertEquals(137L, statCaptor.getValue().getDocCount());
+  }
+
+  @Test
+  void refreshAsync_whenCompletedMarkerPresent_stillProceeds() {
+    Map<String, Object> completed = new LinkedHashMap<>();
+    completed.put("status", TableStatistic.STATUS_COMPLETED);
+    completed.put("last_updated_time", Instant.now().toString());
+    mockGetRaw(Optional.of(completed));
+    mockPutStatusSuccess();
+    mockSearchSuccess(buildResponse(10L, null));
+    mockPutSuccess();
+
+    collector.refreshAsync("idx", Map.of("status", OpenSearchDataType.of(MappingType.Keyword)));
+
+    verify(nodeClient).search(any(SearchRequest.class), any());
+    verify(storage).put(eq("idx"), any(), any());
+  }
+
+  @Test
+  void refreshAsync_whenSearchFails_writesFailedStatus() {
+    mockGetRaw(Optional.empty());
+    mockPutStatusSuccess();
+    mockSearchFailure(new RuntimeException("boom"));
+
+    collector.refreshAsync("idx", Map.of("status", OpenSearchDataType.of(MappingType.Keyword)));
+
+    verify(storage).putStatus(eq("idx"), eq(TableStatistic.STATUS_GENERATING), any());
+    verify(storage).putStatus(eq("idx"), eq(TableStatistic.STATUS_FAILED), any());
+    verify(storage, never()).put(any(), any(), any());
+  }
+
+  // ---- parseSearchResponse -----------------------------------------------
+
+  @Test
+  void parseSearchResponse_populatesFieldStatistics() {
+    InternalCardinality statusCard = mock(InternalCardinality.class);
+    when(statusCard.getValue()).thenReturn(5L);
+
+    InternalCardinality latencyCard = mock(InternalCardinality.class);
+    when(latencyCard.getValue()).thenReturn(800L);
+
+    InternalMin latencyMin = mock(InternalMin.class);
+    when(latencyMin.getValue()).thenReturn(1.0);
+
+    InternalMax latencyMax = mock(InternalMax.class);
+    when(latencyMax.getValue()).thenReturn(999.0);
+
+    InternalAggregations subAggs = mock(InternalAggregations.class);
+    lenient()
+        .when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "status"))
+        .thenReturn(statusCard);
+    lenient()
+        .when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency"))
+        .thenReturn(latencyCard);
+    lenient()
+        .when(subAggs.get(TableStatisticCollector.MIN_PREFIX + "latency"))
+        .thenReturn(latencyMin);
+    lenient()
+        .when(subAggs.get(TableStatisticCollector.MAX_PREFIX + "latency"))
+        .thenReturn(latencyMax);
+
+    InternalSampler sampler = mock(InternalSampler.class);
+    when(sampler.getAggregations()).thenReturn(subAggs);
+
+    SearchResponse response = buildResponse(123L, sampler);
+
+    Map<String, OpenSearchDataType> fieldTypes = new LinkedHashMap<>();
+    fieldTypes.put("status", OpenSearchDataType.of(MappingType.Keyword));
+    fieldTypes.put("latency", OpenSearchDataType.of(MappingType.Long));
+
+    TableStatistic stat = collector.parseSearchResponse(response, fieldTypes);
+
+    assertEquals(123L, stat.getDocCount());
+    FieldStatistic statusStat = stat.getFieldStatistic("status");
+    assertNotNull(statusStat);
+    assertEquals(5L, statusStat.cardinality());
+
+    FieldStatistic latencyStat = stat.getFieldStatistic("latency");
+    assertNotNull(latencyStat);
+    assertEquals(800L, latencyStat.cardinality());
+    assertEquals(1.0, (Double) latencyStat.minValue());
+    assertEquals(999.0, (Double) latencyStat.maxValue());
+  }
+
+  @Test
+  void parseSearchResponse_handlesMissingAggregations() {
+    // Sampler not present in response
+    SearchResponse response = buildResponse(42L, null);
+    Map<String, OpenSearchDataType> fieldTypes =
+        Map.of("status", OpenSearchDataType.of(MappingType.Keyword));
+
+    TableStatistic stat = collector.parseSearchResponse(response, fieldTypes);
+
+    assertEquals(42L, stat.getDocCount());
+    assertTrue(stat.getFields().isEmpty(), "fields should be empty when sampler missing");
+  }
+
+  @Test
+  void parseSearchResponse_infiniteMinMax_returnsNull() {
+    InternalCardinality card = mock(InternalCardinality.class);
+    when(card.getValue()).thenReturn(0L);
+    InternalMin min = mock(InternalMin.class);
+    when(min.getValue()).thenReturn(Double.POSITIVE_INFINITY);
+    InternalMax max = mock(InternalMax.class);
+    when(max.getValue()).thenReturn(Double.NEGATIVE_INFINITY);
+
+    InternalAggregations subAggs = mock(InternalAggregations.class);
+    when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency")).thenReturn(card);
+    when(subAggs.get(TableStatisticCollector.MIN_PREFIX + "latency")).thenReturn(min);
+    when(subAggs.get(TableStatisticCollector.MAX_PREFIX + "latency")).thenReturn(max);
+
+    InternalSampler sampler = mock(InternalSampler.class);
+    when(sampler.getAggregations()).thenReturn(subAggs);
+
+    SearchResponse response = buildResponse(10L, sampler);
+    Map<String, OpenSearchDataType> fieldTypes =
+        Map.of("latency", OpenSearchDataType.of(MappingType.Long));
+
+    TableStatistic stat = collector.parseSearchResponse(response, fieldTypes);
+
+    FieldStatistic latency = stat.getFieldStatistic("latency");
+    assertNotNull(latency);
+    assertNull(latency.minValue(), "POSITIVE_INFINITY should map to null");
+    assertNull(latency.maxValue(), "NEGATIVE_INFINITY should map to null");
+  }
+
+  // ---- helpers ------------------------------------------------------------
+
+  private SearchResponse buildResponse(long totalHits, InternalSampler sampler) {
+    SearchResponse response = mock(SearchResponse.class);
+    SearchHits hits =
+        new SearchHits(
+            new org.opensearch.search.SearchHit[0],
+            new TotalHits(totalHits, TotalHits.Relation.EQUAL_TO),
+            1.0F);
+    when(response.getHits()).thenReturn(hits);
+    Aggregations topLevel = mock(Aggregations.class);
+    when(topLevel.get(TableStatisticCollector.SAMPLER_AGG)).thenReturn(sampler);
+    when(response.getAggregations()).thenReturn(topLevel);
+    return response;
+  }
+
+  private void mockGetRaw(Optional<Map<String, Object>> result) {
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<Map<String, Object>>> listener = invocation.getArgument(1);
+              listener.onResponse(result);
+              return null;
+            })
+        .when(storage)
+        .getRaw(any(), any());
+  }
+
+  private void mockPutStatusSuccess() {
+    doAnswer(
+            invocation -> {
+              ActionListener<Void> listener = invocation.getArgument(2);
+              listener.onResponse(null);
+              return null;
+            })
+        .when(storage)
+        .putStatus(any(), any(), any());
+  }
+
+  private void mockPutSuccess() {
+    doAnswer(
+            invocation -> {
+              ActionListener<Void> listener = invocation.getArgument(2);
+              listener.onResponse(null);
+              return null;
+            })
+        .when(storage)
+        .put(any(), any(), any());
+  }
+
+  private void mockSearchSuccess(SearchResponse response) {
+    doAnswer(
+            invocation -> {
+              ActionListener<SearchResponse> listener = invocation.getArgument(1);
+              listener.onResponse(response);
+              return null;
+            })
+        .when(nodeClient)
+        .search(any(SearchRequest.class), any());
+  }
+
+  private void mockSearchFailure(Exception e) {
+    doAnswer(
+            invocation -> {
+              ActionListener<SearchResponse> listener = invocation.getArgument(1);
+              listener.onFailure(e);
+              return null;
+            })
+        .when(nodeClient)
+        .search(any(SearchRequest.class), any());
+  }
+}
