@@ -24,6 +24,7 @@ import lombok.RequiredArgsConstructor;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.metadata.BuiltInMetadata;
 import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.util.CompositeMap;
@@ -53,6 +54,7 @@ import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScanBuilder;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticDistinctRowCountHandler;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalAD;
@@ -305,6 +307,25 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   private Statistic cacheAndReturn(Statistic stat) {
     cachedStatistic = stat;
     return stat;
+  }
+
+  /**
+   * Expose a Calcite {@link BuiltInMetadata.DistinctRowCount.Handler} when a {@link TableStatistic}
+   * is available for this index. Calcite's {@code RelMdDistinctRowCount.getDistinctRowCount(
+   * TableScan, ...)} unwraps this handler type from the scan's table and, when present, delegates
+   * to it — which in turn lets {@code RelMdRowCount.getRowCount(Aggregate)} use real per-column
+   * cardinalities instead of falling back to {@code inputRowCount / 10}.
+   */
+  @Override
+  public <C> @Nullable C unwrap(Class<C> aClass) {
+    if (aClass == BuiltInMetadata.DistinctRowCount.Handler.class) {
+      Statistic stat = getStatistic();
+      if (stat instanceof TableStatistic tableStat) {
+        return aClass.cast(new TableStatisticDistinctRowCountHandler(tableStat));
+      }
+      return null;
+    }
+    return super.unwrap(aClass);
   }
 
   private void triggerRefreshIfNeeded() {
