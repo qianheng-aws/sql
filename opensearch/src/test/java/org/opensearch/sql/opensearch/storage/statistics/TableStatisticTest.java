@@ -241,4 +241,66 @@ class TableStatisticTest {
     assertNotNull(stat.getCollations());
     assertTrue(stat.getCollations().isEmpty());
   }
+
+  @Test
+  void fromStoredDoc_nonCompletedStatus_throwsIAE() {
+    // A GENERATING document should not be returned as a usable TableStatistic.
+    Map<String, Object> generatingDoc = new LinkedHashMap<>();
+    generatingDoc.put("status", TableStatistic.STATUS_GENERATING);
+    generatingDoc.put("doc_count", 100);
+    generatingDoc.put("last_updated_time", Instant.now().toString());
+    IllegalArgumentException ex =
+        assertThrows(
+            IllegalArgumentException.class, () -> TableStatistic.fromStoredDoc(generatingDoc));
+    assertTrue(ex.getMessage().contains("non-COMPLETED"));
+    assertTrue(ex.getMessage().contains("GENERATING"));
+
+    Map<String, Object> failedDoc = new LinkedHashMap<>();
+    failedDoc.put("status", TableStatistic.STATUS_FAILED);
+    failedDoc.put("doc_count", 100);
+    failedDoc.put("last_updated_time", Instant.now().toString());
+    assertThrows(IllegalArgumentException.class, () -> TableStatistic.fromStoredDoc(failedDoc));
+  }
+
+  @Test
+  void fromStoredDoc_completedStatus_succeeds() {
+    // Explicit COMPLETED is accepted. Missing status field is also accepted (backwards-compat).
+    Map<String, Object> doc = new LinkedHashMap<>();
+    doc.put("status", TableStatistic.STATUS_COMPLETED);
+    doc.put("doc_count", 42);
+    doc.put("last_updated_time", Instant.now().toString());
+    TableStatistic stat = TableStatistic.fromStoredDoc(doc);
+    assertEquals(42L, stat.getDocCount());
+  }
+
+  @Test
+  void fromStoredDoc_malformedTimestamp_throwsIAE() {
+    Map<String, Object> doc = new LinkedHashMap<>();
+    doc.put("doc_count", 100);
+    doc.put("last_updated_time", "not-an-iso-timestamp");
+    IllegalArgumentException ex =
+        assertThrows(IllegalArgumentException.class, () -> TableStatistic.fromStoredDoc(doc));
+    assertTrue(
+        ex.getMessage().contains("Failed to parse TableStatistic document"),
+        "Expected wrapping message, got: " + ex.getMessage());
+  }
+
+  @Test
+  void fromStoredDoc_docCountNotNumber_throwsIAE() {
+    Map<String, Object> doc = new LinkedHashMap<>();
+    doc.put("doc_count", "not-a-number");
+    doc.put("last_updated_time", Instant.now().toString());
+    assertThrows(IllegalArgumentException.class, () -> TableStatistic.fromStoredDoc(doc));
+  }
+
+  @Test
+  void fromStoredDoc_fieldsEntryNonMap_throwsIAE() {
+    Map<String, Object> doc = new LinkedHashMap<>();
+    doc.put("doc_count", 100);
+    doc.put("last_updated_time", Instant.now().toString());
+    doc.put("fields", Map.of("bad", "not-a-map"));
+    IllegalArgumentException ex =
+        assertThrows(IllegalArgumentException.class, () -> TableStatistic.fromStoredDoc(doc));
+    assertTrue(ex.getMessage().contains("bad"));
+  }
 }

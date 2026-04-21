@@ -12,6 +12,7 @@ import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import org.apache.calcite.rel.RelCollation;
 import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.util.ImmutableBitSet;
@@ -23,7 +24,11 @@ import org.apache.calcite.util.ImmutableBitSet;
  */
 public class TableStatistic implements Statistic {
 
-  private static final String STATUS_COMPLETED = "COMPLETED";
+  /** Statuses written into the stored document. */
+  public static final String STATUS_COMPLETED = "COMPLETED";
+
+  public static final String STATUS_GENERATING = "GENERATING";
+  public static final String STATUS_FAILED = "FAILED";
 
   private final long docCount;
   private final Map<String, FieldStatistic> fields;
@@ -33,7 +38,7 @@ public class TableStatistic implements Statistic {
       long docCount, Map<String, FieldStatistic> fields, Instant lastUpdatedTime) {
     this.docCount = docCount;
     this.fields = Collections.unmodifiableMap(new LinkedHashMap<>(fields));
-    this.lastUpdatedTime = lastUpdatedTime;
+    this.lastUpdatedTime = Objects.requireNonNull(lastUpdatedTime, "lastUpdatedTime");
   }
 
   /**
@@ -56,31 +61,54 @@ public class TableStatistic implements Statistic {
   /**
    * Parse a stored document source map (as retrieved from the statistics index) into a {@link
    * TableStatistic}. The writer controls the document schema, so missing required keys ({@code
-   * doc_count}, {@code last_updated_time}) are surfaced as {@link IllegalArgumentException}.
+   * doc_count}, {@code last_updated_time}), non-{@code COMPLETED} status, or malformed values
+   * (wrong types, unparseable timestamp) are all surfaced as {@link IllegalArgumentException}.
+   *
+   * <p>Callers should catch {@code IllegalArgumentException} for any parse failure; no other
+   * exception type escapes.
    */
   @SuppressWarnings("unchecked")
   public static TableStatistic fromStoredDoc(Map<String, Object> sourceMap) {
-    if (!sourceMap.containsKey("doc_count")) {
-      throw new IllegalArgumentException("TableStatistic document is missing doc_count");
-    }
-    if (!sourceMap.containsKey("last_updated_time")) {
-      throw new IllegalArgumentException("TableStatistic document is missing last_updated_time");
-    }
-
-    long docCount = ((Number) sourceMap.get("doc_count")).longValue();
-    Instant lastUpdatedTime = Instant.parse((String) sourceMap.get("last_updated_time"));
-
-    Map<String, FieldStatistic> fieldStats = new LinkedHashMap<>();
-    Object rawFields = sourceMap.get("fields");
-    if (rawFields instanceof Map<?, ?> fieldsMap) {
-      for (Map.Entry<?, ?> entry : fieldsMap.entrySet()) {
-        String fieldName = (String) entry.getKey();
-        Map<String, Object> fieldData = (Map<String, Object>) entry.getValue();
-        fieldStats.put(fieldName, FieldStatistic.fromInsightMap(fieldData));
+    try {
+      if (!sourceMap.containsKey("doc_count")) {
+        throw new IllegalArgumentException("TableStatistic document is missing doc_count");
       }
-    }
+      if (!sourceMap.containsKey("last_updated_time")) {
+        throw new IllegalArgumentException("TableStatistic document is missing last_updated_time");
+      }
+      Object status = sourceMap.get("status");
+      if (status != null && !STATUS_COMPLETED.equals(status)) {
+        throw new IllegalArgumentException(
+            "TableStatistic document has non-COMPLETED status: " + status);
+      }
 
-    return new TableStatistic(docCount, fieldStats, lastUpdatedTime);
+      long docCount = ((Number) sourceMap.get("doc_count")).longValue();
+      Instant lastUpdatedTime = Instant.parse((String) sourceMap.get("last_updated_time"));
+
+      Map<String, FieldStatistic> fieldStats = new LinkedHashMap<>();
+      Object rawFields = sourceMap.get("fields");
+      if (rawFields instanceof Map<?, ?> fieldsMap) {
+        for (Map.Entry<?, ?> entry : fieldsMap.entrySet()) {
+          if (!(entry.getKey() instanceof String fieldName)) {
+            throw new IllegalArgumentException(
+                "TableStatistic fields entry has non-String key: " + entry.getKey());
+          }
+          if (!(entry.getValue() instanceof Map<?, ?> rawFieldData)) {
+            throw new IllegalArgumentException(
+                "TableStatistic fields entry '" + fieldName + "' has non-Map value");
+          }
+          fieldStats.put(
+              fieldName, FieldStatistic.fromInsightMap((Map<String, Object>) rawFieldData));
+        }
+      }
+
+      return new TableStatistic(docCount, fieldStats, lastUpdatedTime);
+    } catch (IllegalArgumentException e) {
+      throw e;
+    } catch (RuntimeException e) {
+      throw new IllegalArgumentException(
+          "Failed to parse TableStatistic document: " + e.getMessage(), e);
+    }
   }
 
   /**
