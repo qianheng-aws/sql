@@ -378,6 +378,8 @@ class OpenSearchIndexTest {
         .get(eq("test"), any());
 
     OpenSearchIndex idx = newIndexWithStats();
+    // Prime the field-type cache so triggerRefreshIfNeeded() can fire refreshAsync.
+    idx.getFieldOpenSearchTypes();
     Statistic stat = idx.getStatistic();
     assertSame(stale, stat);
     verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
@@ -401,12 +403,17 @@ class OpenSearchIndexTest {
         .get(eq("test"), any());
 
     OpenSearchIndex idx = newIndexWithStats();
+    // Prime the field-type cache so triggerRefreshIfNeeded() can fire refreshAsync.
+    idx.getFieldOpenSearchTypes();
     assertEquals(Statistics.UNKNOWN, idx.getStatistic());
     verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
   }
 
   @Test
   void getStatistic_whenStorageTimesOut_returnsUnknownAndTriggersRefresh() {
+    // NOTE: This test intentionally waits the full STORAGE_READ_TIMEOUT_MS (500 ms wall time).
+    // If that constant is ever raised, update this test to inject a shorter timeout rather
+    // than silently inflating CI duration.
     when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
     when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
     when(client.getIndexMappings("test")).thenReturn(ImmutableMap.of("test", mapping));
@@ -417,6 +424,9 @@ class OpenSearchIndexTest {
     doAnswer(invocation -> null).when(statisticStorage).get(eq("test"), any());
 
     OpenSearchIndex idx = newIndexWithStats();
+    // Prime the field-type cache so triggerRefreshIfNeeded() can fire refreshAsync.
+    idx.getFieldOpenSearchTypes();
+
     assertEquals(Statistics.UNKNOWN, idx.getStatistic());
     verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
   }
@@ -443,5 +453,63 @@ class OpenSearchIndexTest {
     assertSame(first, second);
     // Storage should only be hit once.
     verify(statisticStorage, times(1)).get(eq("test"), any());
+  }
+
+  @Test
+  void getStatistic_missCachesUnknown_preventsRepeatedStorageHits() {
+    // Regression: same-query repeated getStatistic() calls on a cold index should NOT
+    // re-issue the 500ms storage read or repeatedly fire refreshAsync. Calcite can call
+    // getStatistic() multiple times within a single optimization pass.
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+    when(client.getIndexMappings("test")).thenReturn(ImmutableMap.of("test", mapping));
+    when(mapping.getFieldMappings())
+        .thenReturn(Map.of("age", OpenSearchDataType.of(MappingType.Integer)));
+
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.empty());
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    idx.getFieldOpenSearchTypes(); // prime mapping cache so refresh can fire
+
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+
+    // Despite 3 calls, storage hit and refresh trigger should only happen once.
+    verify(statisticStorage, times(1)).get(eq("test"), any());
+    verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
+  }
+
+  @Test
+  void getStatistic_skipsRefreshWhenMappingNotLoaded() {
+    // Defensive: if getStatistic() is ever invoked before the field-type cache is populated,
+    // triggerRefreshIfNeeded() must skip rather than synchronously fetch the mapping (which
+    // would double the blocking cost on the optimizer thread).
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.empty());
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    // Intentionally do NOT call getFieldOpenSearchTypes().
+
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    // Storage read still happened, but refresh should be skipped to avoid the mapping fetch.
+    verify(statisticStorage, times(1)).get(eq("test"), any());
+    verify(statisticCollector, never()).refreshAsync(any(), any());
   }
 }

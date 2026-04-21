@@ -243,14 +243,19 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
 
   @Override
   public Statistic getStatistic() {
+    // cachedStatistic memoizes the outcome (including Statistics.UNKNOWN) for the life of this
+    // OpenSearchIndex instance. OpenSearchStorageEngine constructs a fresh instance per query,
+    // so this cache is intentionally short-lived — it exists to keep Calcite's optimizer from
+    // re-issuing the 500 ms storage read and fire-and-forget refresh on every rule application
+    // within a single query.
     if (cachedStatistic != null) {
       return cachedStatistic;
     }
     if (!Boolean.TRUE.equals(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED))) {
-      return Statistics.UNKNOWN;
+      return cacheAndReturn(Statistics.UNKNOWN);
     }
     if (client.getNodeClient().isEmpty() || statisticStorage == null) {
-      return Statistics.UNKNOWN;
+      return cacheAndReturn(Statistics.UNKNOWN);
     }
 
     String rawIndexName = indexName.getIndexNames()[0];
@@ -276,17 +281,17 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
       if (!latch.await(STORAGE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
         LOG.debug("Timed out reading statistic for {}", rawIndexName);
         triggerRefreshIfNeeded();
-        return Statistics.UNKNOWN;
+        return cacheAndReturn(Statistics.UNKNOWN);
       }
     } catch (InterruptedException e) {
       Thread.currentThread().interrupt();
-      return Statistics.UNKNOWN;
+      return cacheAndReturn(Statistics.UNKNOWN);
     }
 
     Optional<TableStatistic> opt = ref.get();
     if (opt.isEmpty()) {
       triggerRefreshIfNeeded();
-      return Statistics.UNKNOWN;
+      return cacheAndReturn(Statistics.UNKNOWN);
     }
 
     TableStatistic stat = opt.get();
@@ -294,6 +299,10 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
     if (stat.isStale(STATISTIC_TTL)) {
       triggerRefreshIfNeeded();
     }
+    return cacheAndReturn(stat);
+  }
+
+  private Statistic cacheAndReturn(Statistic stat) {
     cachedStatistic = stat;
     return stat;
   }
@@ -302,8 +311,16 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
     if (statisticCollector == null) {
       return;
     }
+    // NOTE: getFieldOpenSearchTypes() synchronously fetches mappings if not already cached.
+    // In practice the mapping is populated during query analysis (before cost), so this is a
+    // cheap field read. If some future path calls getStatistic() on an OpenSearchIndex whose
+    // mapping hasn't been fetched yet, skip the refresh rather than pay a second blocking call.
+    if (cachedFieldOpenSearchTypes == null) {
+      LOG.debug("Skipping stat refresh for {}: field mapping not yet loaded", indexName);
+      return;
+    }
     try {
-      statisticCollector.refreshAsync(indexName.getIndexNames()[0], getFieldOpenSearchTypes());
+      statisticCollector.refreshAsync(indexName.getIndexNames()[0], cachedFieldOpenSearchTypes);
     } catch (RuntimeException e) {
       // refreshAsync is documented fire-and-forget; defend anyway.
       LOG.debug("Failed to trigger stat refresh for {}: {}", indexName, e.getMessage());
