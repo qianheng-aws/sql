@@ -14,6 +14,7 @@ import java.util.Optional;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.ExceptionsHelper;
+import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -79,6 +80,10 @@ public class TableStatisticStorage {
    * Fetch the {@link TableStatistic} for {@code indexName}. Returns {@link Optional#empty()} when
    * the doc is missing, the storage index does not exist, parsing fails, the doc status is
    * non-{@code COMPLETED}, or the transport call fails. Never calls {@code onFailure}.
+   *
+   * <p>Callers that need to observe the raw record (including a {@code GENERATING} or {@code
+   * FAILED} status — e.g. the collector's race-protection step) should use {@link #getRaw(String,
+   * ActionListener)} instead.
    */
   public void get(String indexName, ActionListener<Optional<TableStatistic>> listener) {
     GetRequest request = new GetRequest(STORAGE_INDEX, docId(indexName));
@@ -105,7 +110,50 @@ public class TableStatisticStorage {
             if (ExceptionsHelper.unwrap(e, IndexNotFoundException.class) != null) {
               LOG.debug("Statistics index {} does not exist yet", STORAGE_INDEX);
             } else {
-              LOG.debug("Failed to get stat doc for {}: {}", indexName, e.getMessage());
+              LOG.warn(
+                  "Failed to get stat doc for {} ({}): {}",
+                  indexName,
+                  e.getClass().getSimpleName(),
+                  e.getMessage());
+            }
+            listener.onResponse(Optional.empty());
+          }
+        });
+  }
+
+  /**
+   * Fetch the raw source map for {@code indexName}'s stored record regardless of status. Used by
+   * the collector to check whether a {@code GENERATING} document already exists (for race
+   * protection).
+   *
+   * <p>Returns {@link Optional#empty()} on doc-missing, index-not-found, or transport failure.
+   * Never calls {@code onFailure}. Does NOT parse into a {@link TableStatistic}; the caller
+   * inspects fields directly (typically {@code status} and {@code last_updated_time}).
+   */
+  public void getRaw(String indexName, ActionListener<Optional<Map<String, Object>>> listener) {
+    GetRequest request = new GetRequest(STORAGE_INDEX, docId(indexName));
+    nodeClient.get(
+        request,
+        new ActionListener<GetResponse>() {
+          @Override
+          public void onResponse(GetResponse response) {
+            if (!response.isExists()) {
+              listener.onResponse(Optional.empty());
+              return;
+            }
+            listener.onResponse(Optional.of(response.getSourceAsMap()));
+          }
+
+          @Override
+          public void onFailure(Exception e) {
+            if (ExceptionsHelper.unwrap(e, IndexNotFoundException.class) != null) {
+              LOG.debug("Statistics index {} does not exist yet", STORAGE_INDEX);
+            } else {
+              LOG.warn(
+                  "Failed to get raw stat doc for {} ({}): {}",
+                  indexName,
+                  e.getClass().getSimpleName(),
+                  e.getMessage());
             }
             listener.onResponse(Optional.empty());
           }
@@ -199,10 +247,16 @@ public class TableStatisticStorage {
 
               @Override
               public void onFailure(Exception e) {
-                // Idempotency-tolerant: another node may have just created the index. Log and
-                // proceed.
-                LOG.debug("Statistics index create failed (may already exist): {}", e.getMessage());
-                listener.onResponse(true);
+                // Idempotency-tolerant ONLY for the concurrent-create race. Any other failure
+                // (mapping conflict from a manually-created index, cluster block, etc.) must
+                // surface so the caller — and operators — can act on it.
+                if (ExceptionsHelper.unwrap(e, ResourceAlreadyExistsException.class) != null) {
+                  LOG.debug("Statistics index was created concurrently by another node");
+                  listener.onResponse(true);
+                } else {
+                  LOG.warn("Failed to create statistics index {}", STORAGE_INDEX, e);
+                  listener.onFailure(e);
+                }
               }
             });
   }

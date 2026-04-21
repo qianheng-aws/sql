@@ -17,6 +17,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -26,6 +27,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
+import org.opensearch.ResourceAlreadyExistsException;
 import org.opensearch.action.admin.indices.create.CreateIndexRequest;
 import org.opensearch.action.admin.indices.create.CreateIndexResponse;
 import org.opensearch.action.admin.indices.exists.indices.IndicesExistsRequest;
@@ -216,12 +218,12 @@ class TableStatisticStorageTest {
   }
 
   @Test
-  void put_indexCreateFailureIsTolerant_stillAttemptsIndex() {
-    // Create failure is treated as "someone else may have already created it" — we still try
-    // to write. This test exercises the idempotency-tolerant path.
+  void put_concurrentCreateRace_isTolerated() {
+    // ResourceAlreadyExistsException means another node just created the index — proceed to write.
     wireAdminChain();
     mockIndexExistsFalse();
-    mockCreateIndexFailure(new RuntimeException("resource_already_exists"));
+    mockCreateIndexFailure(
+        new ResourceAlreadyExistsException("index [.opensearch-statistics] already exists"));
     mockIndexSuccess();
 
     TableStatistic stat = TableStatistic.fromFields(5L, Map.of());
@@ -234,6 +236,25 @@ class TableStatisticStorageTest {
     verify(nodeClient).index(any(IndexRequest.class), any());
     verify(listener).onResponse(null);
     verify(listener, never()).onFailure(any());
+  }
+
+  @Test
+  void put_genuineCreateFailure_propagates() {
+    // Any failure other than ResourceAlreadyExistsException (e.g. mapping conflict from a
+    // pre-existing manually-created index, or a cluster block) must surface to the caller.
+    wireAdminChain();
+    mockIndexExistsFalse();
+    RuntimeException boom = new RuntimeException("cluster is read-only");
+    mockCreateIndexFailure(boom);
+
+    TableStatistic stat = TableStatistic.fromFields(5L, Map.of());
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Void> listener = mock(ActionListener.class);
+    storage.put("idx", stat, listener);
+
+    verify(listener).onFailure(boom);
+    verify(nodeClient, never()).index(any(IndexRequest.class), any());
   }
 
   @Test
@@ -281,6 +302,70 @@ class TableStatisticStorageTest {
     assertFalse(source.containsKey("fields"));
 
     verify(listener).onResponse(null);
+  }
+
+  @Test
+  void get_afterPutStatusGenerating_returnsEmpty() {
+    // Contract test: when a GENERATING marker written by putStatus is subsequently read back via
+    // get(), fromStoredDoc must reject it (missing doc_count + non-COMPLETED status), and get()
+    // must swallow the IAE into Optional.empty(). This is the coordination path used by the
+    // collector (Task 3) for race protection.
+    Map<String, Object> generatingDoc = new LinkedHashMap<>();
+    generatingDoc.put("status", TableStatistic.STATUS_GENERATING);
+    generatingDoc.put("last_updated_time", java.time.Instant.now().toString());
+    mockGetSuccess(generatingDoc);
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Optional<TableStatistic>> listener = mock(ActionListener.class);
+    storage.get("idx", listener);
+
+    verify(listener).onResponse(Optional.empty());
+    verify(listener, never()).onFailure(any());
+  }
+
+  // ---- getRaw --------------------------------------------------------------
+
+  @Test
+  void getRaw_docExists_returnsSourceMap() {
+    Map<String, Object> source = new LinkedHashMap<>();
+    source.put("status", TableStatistic.STATUS_GENERATING);
+    source.put("last_updated_time", java.time.Instant.now().toString());
+    mockGetSuccess(source);
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Optional<Map<String, Object>>> listener = mock(ActionListener.class);
+    storage.getRaw("idx", listener);
+
+    ArgumentCaptor<Optional<Map<String, Object>>> captor = ArgumentCaptor.forClass(Optional.class);
+    verify(listener).onResponse(captor.capture());
+    Optional<Map<String, Object>> result = captor.getValue();
+    assertTrue(result.isPresent());
+    assertEquals(TableStatistic.STATUS_GENERATING, result.get().get("status"));
+    verify(listener, never()).onFailure(any());
+  }
+
+  @Test
+  void getRaw_docMissing_returnsEmpty() {
+    mockGetMissing();
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Optional<Map<String, Object>>> listener = mock(ActionListener.class);
+    storage.getRaw("idx", listener);
+
+    verify(listener).onResponse(Optional.empty());
+    verify(listener, never()).onFailure(any());
+  }
+
+  @Test
+  void getRaw_indexNotFound_returnsEmpty() {
+    mockGetFailure(new IndexNotFoundException(".opensearch-statistics"));
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Optional<Map<String, Object>>> listener = mock(ActionListener.class);
+    storage.getRaw("idx", listener);
+
+    verify(listener).onResponse(Optional.empty());
+    verify(listener, never()).onFailure(any());
   }
 
   // ---- mocking helpers -----------------------------------------------------
