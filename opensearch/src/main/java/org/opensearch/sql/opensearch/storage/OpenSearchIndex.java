@@ -8,11 +8,15 @@ package org.opensearch.sql.opensearch.storage;
 import static org.opensearch.search.aggregations.MultiBucketConsumerService.DEFAULT_MAX_BUCKETS;
 
 import com.google.common.annotations.VisibleForTesting;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Optional;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import lombok.Getter;
@@ -23,7 +27,11 @@ import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.schema.Statistic;
 import org.apache.calcite.schema.Statistics;
 import org.apache.calcite.util.CompositeMap;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.checkerframework.checker.nullness.qual.Nullable;
 import org.opensearch.common.unit.TimeValue;
+import org.opensearch.core.action.ActionListener;
 import org.opensearch.sql.calcite.plan.AbstractOpenSearchTable;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -43,8 +51,9 @@ import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexReque
 import org.opensearch.sql.opensearch.storage.scan.CalciteLogicalIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScanBuilder;
-import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
-import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatisticProvider;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalAD;
 import org.opensearch.sql.planner.logical.LogicalEval;
@@ -57,6 +66,14 @@ import org.opensearch.transport.client.node.NodeClient;
 
 /** OpenSearch table (index) implementation. */
 public class OpenSearchIndex extends AbstractOpenSearchTable {
+
+  private static final Logger LOG = LogManager.getLogger(OpenSearchIndex.class);
+
+  /** Synchronous budget for reading a stored statistic from the statistics index. */
+  private static final long STORAGE_READ_TIMEOUT_MS = 500L;
+
+  /** Time-to-live for stored statistics; older than this triggers an async refresh. */
+  private static final Duration STATISTIC_TTL = Duration.ofHours(24);
 
   public static final String METADATA_FIELD_ID = "_id";
   public static final String METADATA_FIELD_INDEX = "_index";
@@ -101,11 +118,28 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   /** The cached Calcite Statistic for this index. */
   private Statistic cachedStatistic = null;
 
-  /** Constructor. */
-  public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName) {
+  @Nullable private final TableStatisticStorage statisticStorage;
+  @Nullable private final TableStatisticCollector statisticCollector;
+
+  /**
+   * Primary constructor: accepts optional statistics services. Pass nulls to disable collection.
+   */
+  public OpenSearchIndex(
+      OpenSearchClient client,
+      Settings settings,
+      String indexName,
+      @Nullable TableStatisticStorage statisticStorage,
+      @Nullable TableStatisticCollector statisticCollector) {
     this.client = client;
     this.settings = settings;
     this.indexName = new OpenSearchRequest.IndexName(indexName);
+    this.statisticStorage = statisticStorage;
+    this.statisticCollector = statisticCollector;
+  }
+
+  /** Backwards-compat: no statistics services wired. Used by callers that don't consume stats. */
+  public OpenSearchIndex(OpenSearchClient client, Settings settings, String indexName) {
+    this(client, settings, indexName, null, null);
   }
 
   @Override
@@ -215,18 +249,65 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
     if (!Boolean.TRUE.equals(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED))) {
       return Statistics.UNKNOWN;
     }
-    Optional<NodeClient> nc = client.getNodeClient();
-    if (nc.isEmpty()) {
+    if (client.getNodeClient().isEmpty() || statisticStorage == null) {
       return Statistics.UNKNOWN;
     }
-    IndexInsightStatisticProvider provider = new IndexInsightStatisticProvider(nc.get());
-    long docCount = getMaxResultWindow().longValue();
-    IndexInsightStatistic stat = provider.getStatistic(indexName.getIndexNames()[0], docCount);
-    if (stat != null) {
-      cachedStatistic = stat;
-      return stat;
+
+    String rawIndexName = indexName.getIndexNames()[0];
+    AtomicReference<Optional<TableStatistic>> ref = new AtomicReference<>(Optional.empty());
+    CountDownLatch latch = new CountDownLatch(1);
+    statisticStorage.get(
+        rawIndexName,
+        new ActionListener<Optional<TableStatistic>>() {
+          @Override
+          public void onResponse(Optional<TableStatistic> result) {
+            ref.set(result);
+            latch.countDown();
+          }
+
+          @Override
+          public void onFailure(Exception e) {
+            // TableStatisticStorage#get never calls onFailure, but defend anyway.
+            latch.countDown();
+          }
+        });
+
+    try {
+      if (!latch.await(STORAGE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+        LOG.debug("Timed out reading statistic for {}", rawIndexName);
+        triggerRefreshIfNeeded();
+        return Statistics.UNKNOWN;
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      return Statistics.UNKNOWN;
     }
-    return Statistics.UNKNOWN;
+
+    Optional<TableStatistic> opt = ref.get();
+    if (opt.isEmpty()) {
+      triggerRefreshIfNeeded();
+      return Statistics.UNKNOWN;
+    }
+
+    TableStatistic stat = opt.get();
+    // Even stale stats are better than UNKNOWN — return them but schedule a refresh.
+    if (stat.isStale(STATISTIC_TTL)) {
+      triggerRefreshIfNeeded();
+    }
+    cachedStatistic = stat;
+    return stat;
+  }
+
+  private void triggerRefreshIfNeeded() {
+    if (statisticCollector == null) {
+      return;
+    }
+    try {
+      statisticCollector.refreshAsync(indexName.getIndexNames()[0], getFieldOpenSearchTypes());
+    } catch (RuntimeException e) {
+      // refreshAsync is documented fire-and-forget; defend anyway.
+      LOG.debug("Failed to trigger stat refresh for {}: {}", indexName, e.getMessage());
+    }
   }
 
   public Integer getQueryBucketSize() {

@@ -11,12 +11,15 @@ import static org.hamcrest.Matchers.allOf;
 import static org.hamcrest.Matchers.hasEntry;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.opensearch.sql.data.type.ExprCoreType.INTEGER;
@@ -32,6 +35,7 @@ import static org.opensearch.sql.planner.logical.LogicalPlanDSL.sort;
 
 import com.google.common.collect.ImmutableMap;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Optional;
@@ -48,11 +52,6 @@ import org.mockito.Mockito;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.common.unit.TimeValue;
 import org.opensearch.core.action.ActionListener;
-import org.opensearch.ml.common.indexInsight.IndexInsight;
-import org.opensearch.ml.common.indexInsight.IndexInsightTaskStatus;
-import org.opensearch.ml.common.indexInsight.MLIndexInsightType;
-import org.opensearch.ml.common.transport.indexInsight.MLIndexInsightGetAction;
-import org.opensearch.ml.common.transport.indexInsight.MLIndexInsightGetResponse;
 import org.opensearch.sql.ast.tree.Sort;
 import org.opensearch.sql.common.setting.Settings;
 import org.opensearch.sql.data.type.ExprCoreType;
@@ -68,7 +67,9 @@ import org.opensearch.sql.opensearch.mapping.IndexMapping;
 import org.opensearch.sql.opensearch.request.OpenSearchRequest;
 import org.opensearch.sql.opensearch.request.OpenSearchRequestBuilder;
 import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScan;
-import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.sql.planner.logical.LogicalPlan;
 import org.opensearch.sql.planner.logical.LogicalPlanDSL;
 import org.opensearch.sql.planner.physical.PhysicalPlanDSL;
@@ -89,6 +90,10 @@ class OpenSearchIndexTest {
 
   @Mock private IndexMapping mapping;
 
+  @Mock private TableStatisticStorage statisticStorage;
+
+  @Mock private TableStatisticCollector statisticCollector;
+
   private OpenSearchIndex index;
 
   @BeforeEach
@@ -98,6 +103,10 @@ class OpenSearchIndexTest {
     lenient()
         .when(settings.getSettingValue(Settings.Key.SQL_CURSOR_KEEP_ALIVE))
         .thenReturn(TimeValue.timeValueMinutes(1));
+  }
+
+  private OpenSearchIndex newIndexWithStats() {
+    return new OpenSearchIndex(client, settings, "test", statisticStorage, statisticCollector);
   }
 
   @Test
@@ -293,50 +302,146 @@ class OpenSearchIndexTest {
   }
 
   @Test
-  void getStatistic_whenInsightEnabled_returnsIndexInsightStatistic() {
-    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
-    NodeClient nodeClient = Mockito.mock(NodeClient.class);
-    when(client.getNodeClient()).thenReturn(Optional.of(nodeClient));
-    when(client.getIndexMaxResultWindows("test")).thenReturn(Map.of("test", 10000));
-
-    String content =
-        "{\"important_column_and_distribution\": {\"status\": "
-            + "{\"type\": \"keyword\", \"unique_count\": 5}}}";
-    IndexInsight insight =
-        IndexInsight.builder()
-            .index("test")
-            .content(content)
-            .status(IndexInsightTaskStatus.COMPLETED)
-            .taskType(MLIndexInsightType.STATISTICAL_DATA)
-            .lastUpdatedTime(Instant.now())
-            .build();
-    MLIndexInsightGetResponse response =
-        MLIndexInsightGetResponse.builder().indexInsight(insight).build();
-    doAnswer(
-            invocation -> {
-              ActionListener<MLIndexInsightGetResponse> listener = invocation.getArgument(2);
-              listener.onResponse(response);
-              return null;
-            })
-        .when(nodeClient)
-        .execute(eq(MLIndexInsightGetAction.INSTANCE), any(), any());
-
-    Statistic stat = index.getStatistic();
-    assertTrue(stat instanceof IndexInsightStatistic);
-  }
-
-  @Test
-  void getStatistic_whenInsightDisabled_returnsUnknown() {
+  void getStatistic_whenFlagOff_returnsUnknown() {
     when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(false);
-    Statistic stat = index.getStatistic();
-    assertEquals(Statistics.UNKNOWN, stat);
+    OpenSearchIndex idx = newIndexWithStats();
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    verify(statisticStorage, never()).get(any(), any());
   }
 
   @Test
   void getStatistic_whenNodeClientAbsent_returnsUnknown() {
     when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
     when(client.getNodeClient()).thenReturn(Optional.empty());
-    Statistic stat = index.getStatistic();
-    assertEquals(Statistics.UNKNOWN, stat);
+    OpenSearchIndex idx = newIndexWithStats();
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    verify(statisticStorage, never()).get(any(), any());
+  }
+
+  @Test
+  void getStatistic_whenStorageNull_returnsUnknown() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    lenient().when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+    // index constructed without storage / collector
+    OpenSearchIndex idx = new OpenSearchIndex(client, settings, "test");
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+  }
+
+  @Test
+  void getStatistic_whenStorageHitFresh_returnsTableStatistic() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+
+    TableStatistic fresh = TableStatistic.fromFields(1234L, Map.of());
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.of(fresh));
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    Statistic stat = idx.getStatistic();
+    assertSame(fresh, stat);
+    verify(statisticCollector, never()).refreshAsync(any(), any());
+  }
+
+  @Test
+  void getStatistic_whenStorageHitStale_returnsStatAndTriggersRefresh() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+    when(client.getIndexMappings("test")).thenReturn(ImmutableMap.of("test", mapping));
+    when(mapping.getFieldMappings())
+        .thenReturn(Map.of("age", OpenSearchDataType.of(MappingType.Integer)));
+
+    Instant oneWeekAgo = Instant.now().minus(7, ChronoUnit.DAYS);
+    Map<String, Object> staleDoc =
+        Map.of(
+            "status",
+            "COMPLETED",
+            "last_updated_time",
+            oneWeekAgo.toString(),
+            "doc_count",
+            4200L,
+            "fields",
+            Map.of());
+    TableStatistic stale = TableStatistic.fromStoredDoc(staleDoc);
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.of(stale));
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    Statistic stat = idx.getStatistic();
+    assertSame(stale, stat);
+    verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
+  }
+
+  @Test
+  void getStatistic_whenStorageMiss_returnsUnknownAndTriggersRefresh() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+    when(client.getIndexMappings("test")).thenReturn(ImmutableMap.of("test", mapping));
+    when(mapping.getFieldMappings())
+        .thenReturn(Map.of("age", OpenSearchDataType.of(MappingType.Integer)));
+
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.empty());
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
+  }
+
+  @Test
+  void getStatistic_whenStorageTimesOut_returnsUnknownAndTriggersRefresh() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+    when(client.getIndexMappings("test")).thenReturn(ImmutableMap.of("test", mapping));
+    when(mapping.getFieldMappings())
+        .thenReturn(Map.of("age", OpenSearchDataType.of(MappingType.Integer)));
+
+    // Simulate timeout — listener never invoked.
+    doAnswer(invocation -> null).when(statisticStorage).get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    assertEquals(Statistics.UNKNOWN, idx.getStatistic());
+    verify(statisticCollector, times(1)).refreshAsync(eq("test"), any());
+  }
+
+  @Test
+  void getStatistic_cachedAcrossCalls() {
+    when(settings.getSettingValue(Settings.Key.TABLE_STATISTICS_ENABLED)).thenReturn(true);
+    when(client.getNodeClient()).thenReturn(Optional.of(Mockito.mock(NodeClient.class)));
+
+    TableStatistic fresh = TableStatistic.fromFields(99L, Map.of());
+    doAnswer(
+            invocation -> {
+              ActionListener<Optional<TableStatistic>> listener = invocation.getArgument(1);
+              listener.onResponse(Optional.of(fresh));
+              return null;
+            })
+        .when(statisticStorage)
+        .get(eq("test"), any());
+
+    OpenSearchIndex idx = newIndexWithStats();
+    Statistic first = idx.getStatistic();
+    Statistic second = idx.getStatistic();
+    assertSame(fresh, first);
+    assertSame(first, second);
+    // Storage should only be hit once.
+    verify(statisticStorage, times(1)).get(eq("test"), any());
   }
 }

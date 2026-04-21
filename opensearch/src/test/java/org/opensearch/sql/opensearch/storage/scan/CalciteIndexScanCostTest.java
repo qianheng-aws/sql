@@ -15,6 +15,7 @@ import static org.mockito.Mockito.when;
 import com.google.common.collect.ImmutableList;
 import java.util.AbstractList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import org.apache.calcite.plan.Convention;
 import org.apache.calcite.plan.RelOptCluster;
@@ -54,7 +55,7 @@ import org.opensearch.sql.opensearch.storage.scan.context.LimitDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.OSRequestBuilderAction;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
-import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 
 @ExtendWith(MockitoExtension.class)
 public class CalciteIndexScanCostTest {
@@ -506,11 +507,9 @@ public class CalciteIndexScanCostTest {
   }
 
   @Test
-  void test_cost_with_insight_statistic_baseline() {
-    IndexInsightStatistic insightStat =
-        IndexInsightStatistic.fromContentJson(
-            "{\"important_column_and_distribution\": {}}", 500_000L);
-    when(osIndex.getStatistic()).thenReturn(insightStat);
+  void test_cost_with_table_statistic_baseline() {
+    TableStatistic stat = TableStatistic.fromFields(500_000L, Map.of());
+    when(osIndex.getStatistic()).thenReturn(stat);
 
     RelDataType relDataType = mock(RelDataType.class);
     lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(10));
@@ -523,11 +522,9 @@ public class CalciteIndexScanCostTest {
   }
 
   @Test
-  void test_estimateRowCount_with_insight_statistic_baseline() {
-    IndexInsightStatistic insightStat =
-        IndexInsightStatistic.fromContentJson(
-            "{\"important_column_and_distribution\": {}}", 500_000L);
-    when(osIndex.getStatistic()).thenReturn(insightStat);
+  void test_estimateRowCount_with_table_statistic() {
+    TableStatistic stat = TableStatistic.fromFields(500_000L, Map.of());
+    when(osIndex.getStatistic()).thenReturn(stat);
 
     RelDataType relDataType = mock(RelDataType.class);
     lenient().when(table.getRowType()).thenReturn(relDataType);
@@ -537,8 +534,8 @@ public class CalciteIndexScanCostTest {
   }
 
   @Test
-  void test_cost_fallback_when_no_insight_statistic() {
-    // getStatistic returns default Statistics.UNKNOWN (not IndexInsightStatistic)
+  void test_cost_fallback_when_no_table_statistic() {
+    // getStatistic returns default Statistics.UNKNOWN (not TableStatistic)
     when(osIndex.getStatistic()).thenReturn(Statistics.UNKNOWN);
 
     RelDataType relDataType = mock(RelDataType.class);

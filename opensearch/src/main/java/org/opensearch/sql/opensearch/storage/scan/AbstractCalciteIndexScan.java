@@ -69,7 +69,7 @@ import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
 import org.opensearch.sql.opensearch.storage.scan.context.RareTopDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.SortExprDigest;
-import org.opensearch.sql.opensearch.storage.statistics.IndexInsightStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 
 /** An abstract relational operator representing a scan of an OpenSearchIndex type. */
 @Getter
@@ -121,14 +121,13 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
-   * Get the baseline row count for cost estimation. Uses {@link
-   * IndexInsightStatistic#getRowCount()} when available (via Index Insight), otherwise falls back
-   * to {@code osIndex.getMaxResultWindow()}.
+   * Get the baseline row count for cost estimation. Uses {@link TableStatistic#getRowCount()} when
+   * a stored statistic is available, otherwise falls back to {@code osIndex.getMaxResultWindow()}.
    */
   private double getBaselineRowCount() {
     Statistic stat = osIndex.getStatistic();
-    if (stat instanceof IndexInsightStatistic insightStat) {
-      return insightStat.getRowCount();
+    if (stat instanceof TableStatistic tableStat) {
+      return tableStat.getRowCount();
     }
     return osIndex.getMaxResultWindow().doubleValue();
   }
