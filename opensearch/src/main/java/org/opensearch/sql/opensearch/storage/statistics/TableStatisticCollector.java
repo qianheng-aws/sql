@@ -256,11 +256,12 @@ public class TableStatisticCollector {
     }
 
     SearchSourceBuilder source =
-        new SearchSourceBuilder()
-            .query(QueryBuilders.matchAllQuery())
-            .size(0)
-            .trackTotalHits(true)
-            .aggregation(samplerAgg);
+        new SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).size(0).trackTotalHits(true);
+    // Sampler with zero sub-aggregations is rejected by OpenSearch ("all shards failed").
+    // Skip the sampler when no fields are eligible — we still get the trackTotalHits doc_count.
+    if (!samplerAgg.getSubAggregations().isEmpty()) {
+      source.aggregation(samplerAgg);
+    }
     return new SearchRequest(indexName).source(source);
   }
 

@@ -150,6 +150,8 @@ public class SQLPlugin extends Plugin
   private DataSourceServiceImpl dataSourceService;
   private OpenSearchAsyncQueryScheduler asyncQueryScheduler;
   private Injector injector;
+  private TableStatisticStorage tableStatisticStorage;
+  private TableStatisticCollector tableStatisticCollector;
 
   public String name() {
     return "sql";
@@ -196,9 +198,7 @@ public class SQLPlugin extends Plugin
         new RestAsyncQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryManagementAction((OpenSearchSettings) pluginSettings),
         new RestDirectQueryResourcesManagementAction((OpenSearchSettings) pluginSettings),
-        new RestTableStatisticsAction(
-            injector.getInstance(TableStatisticStorage.class),
-            injector.getInstance(TableStatisticCollector.class)));
+        new RestTableStatisticsAction(tableStatisticStorage, tableStatisticCollector));
   }
 
   /** Register action and handler so that transportClient can find proxy for action. */
@@ -272,13 +272,22 @@ public class SQLPlugin extends Plugin
     this.clusterService = clusterService;
     this.pluginSettings = new OpenSearchSettings(clusterService.getClusterSettings());
     this.client = (NodeClient) client;
+    // Instantiate table-statistics singletons BEFORE createDataSourceService so the default
+    // OpenSearch data source (constructed via OpenSearchDataSourceFactory, not Guice) can
+    // consume them. These are also bound into the Guice injector below so that
+    // OpenSearchPluginModule's @Provides methods use the same instances.
+    this.tableStatisticStorage = new TableStatisticStorage(this.client);
+    this.tableStatisticCollector =
+        new TableStatisticCollector(this.client, this.tableStatisticStorage);
     this.dataSourceService = createDataSourceService();
     dataSourceService.createDataSource(defaultOpenSearchDataSourceMetadata());
     LocalClusterState.state().setClusterService(clusterService);
     LocalClusterState.state().setPluginSettings((OpenSearchSettings) pluginSettings);
     LocalClusterState.state().setClient(client);
     ModulesBuilder modules = new ModulesBuilder();
-    modules.add(new OpenSearchPluginModule(executionEngineExtensions));
+    modules.add(
+        new OpenSearchPluginModule(
+            executionEngineExtensions, tableStatisticStorage, tableStatisticCollector));
     modules.add(
         b -> {
           b.bind(NodeClient.class).toInstance((NodeClient) client);
@@ -403,7 +412,10 @@ public class SQLPlugin extends Plugin
         new ImmutableSet.Builder<DataSourceFactory>()
             .add(
                 new OpenSearchDataSourceFactory(
-                    new OpenSearchNodeClient(this.client), pluginSettings))
+                    new OpenSearchNodeClient(this.client),
+                    pluginSettings,
+                    tableStatisticStorage,
+                    tableStatisticCollector))
             .add(new PrometheusStorageFactory(pluginSettings))
             .add(new GlueDataSourceFactory(pluginSettings))
             .add(new SecurityLakeDataSourceFactory(pluginSettings))

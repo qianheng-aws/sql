@@ -6,7 +6,6 @@
 package org.opensearch.sql.plugin.config;
 
 import java.util.List;
-import lombok.RequiredArgsConstructor;
 import org.opensearch.common.inject.AbstractModule;
 import org.opensearch.common.inject.Provides;
 import org.opensearch.common.inject.Singleton;
@@ -42,14 +41,29 @@ import org.opensearch.sql.sql.antlr.SQLSyntaxParser;
 import org.opensearch.sql.storage.StorageEngine;
 import org.opensearch.transport.client.node.NodeClient;
 
-@RequiredArgsConstructor
 public class OpenSearchPluginModule extends AbstractModule {
 
   private final List<ExecutionEngine> executionEngineExtensions;
+  private final TableStatisticStorage tableStatisticStorage;
+  private final TableStatisticCollector tableStatisticCollector;
 
-  /** Default constructor for when no engines are available. */
+  /** Default constructor for when no engines / statistics services are available. */
   public OpenSearchPluginModule() {
-    this(List.of());
+    this(List.of(), null, null);
+  }
+
+  /** Backwards-compat: no statistics services wired. */
+  public OpenSearchPluginModule(List<ExecutionEngine> executionEngineExtensions) {
+    this(executionEngineExtensions, null, null);
+  }
+
+  public OpenSearchPluginModule(
+      List<ExecutionEngine> executionEngineExtensions,
+      TableStatisticStorage tableStatisticStorage,
+      TableStatisticCollector tableStatisticCollector) {
+    this.executionEngineExtensions = executionEngineExtensions;
+    this.tableStatisticStorage = tableStatisticStorage;
+    this.tableStatisticCollector = tableStatisticCollector;
   }
 
   private final BuiltinFunctionRepository functionRepository =
@@ -63,26 +77,16 @@ public class OpenSearchPluginModule extends AbstractModule {
     return new OpenSearchNodeClient(nodeClient);
   }
 
+  /**
+   * Reuse the {@link TableStatisticStorage} / {@link TableStatisticCollector} instances that {@link
+   * org.opensearch.sql.plugin.SQLPlugin} pre-created so every OpenSearchStorageEngine in the
+   * injector — as well as the default-OpenSearch-datasource factory and the REST handler — shares
+   * the same singletons.
+   */
   @Provides
-  @Singleton
-  public TableStatisticStorage tableStatisticStorage(NodeClient nodeClient) {
-    return new TableStatisticStorage(nodeClient);
-  }
-
-  @Provides
-  @Singleton
-  public TableStatisticCollector tableStatisticCollector(
-      NodeClient nodeClient, TableStatisticStorage storage) {
-    return new TableStatisticCollector(nodeClient, storage);
-  }
-
-  @Provides
-  public StorageEngine storageEngine(
-      OpenSearchClient client,
-      Settings settings,
-      TableStatisticStorage statisticStorage,
-      TableStatisticCollector statisticCollector) {
-    return new OpenSearchStorageEngine(client, settings, statisticStorage, statisticCollector);
+  public StorageEngine storageEngine(OpenSearchClient client, Settings settings) {
+    return new OpenSearchStorageEngine(
+        client, settings, tableStatisticStorage, tableStatisticCollector);
   }
 
   @Provides
