@@ -18,6 +18,10 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
+import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
+import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
+import org.opensearch.sql.opensearch.request.OpenSearchRequest;
+import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexRequest;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
@@ -76,7 +80,7 @@ public class RestTableStatisticsAction extends BaseRestHandler {
           channel.sendResponse(new BytesRestResponse(RestStatus.BAD_REQUEST, validationError));
     }
     if (request.method() == RestRequest.Method.POST) {
-      return channel -> handleAnalyze(indexName, channel);
+      return channel -> handleAnalyze(indexName, client, channel);
     }
     return channel -> handleGet(indexName, channel);
   }
@@ -126,22 +130,52 @@ public class RestTableStatisticsAction extends BaseRestHandler {
         });
   }
 
-  private void handleAnalyze(String indexName, RestChannel channel) {
+  /**
+   * Trigger an async refresh. The collector's aggregation request is built from a field map, and a
+   * missing map produces a docCount-only stat — almost useless to the optimizer. So before handing
+   * off to the collector we resolve the mapping via {@link OpenSearchDescribeIndexRequest}, which
+   * blocks on a cluster admin call. That blocking work cannot run on the Netty transport thread
+   * (OpenSearch asserts against it), so we dispatch it to the generic thread pool and respond 202
+   * immediately — callers should poll {@code GET /_statistics/{index}} for {@code COMPLETED} before
+   * trusting the numbers, which they already had to do because of the collector's async search
+   * anyway.
+   */
+  private void handleAnalyze(String indexName, NodeClient nodeClient, RestChannel channel) {
     try {
-      // For the POC the REST endpoint triggers a collect without a pre-fetched field map.
-      // The collector accepts an empty map (produces a docCount-only stat). Operator can
-      // re-run /analyze after querying the index at least once so the field-type cache warms.
-      collector.refreshAsync(indexName, Map.of());
+      nodeClient
+          .threadPool()
+          .generic()
+          .submit(() -> resolveMappingsAndTriggerRefresh(indexName, nodeClient));
       channel.sendResponse(
           new BytesRestResponse(
               RestStatus.ACCEPTED, "application/json", "{\"status\":\"triggered\"}"));
     } catch (Exception e) {
-      LOG.warn("Failed to trigger analyze for {}: {}", indexName, e.getMessage());
+      LOG.warn("Failed to dispatch analyze for {}: {}", indexName, e.getMessage());
       channel.sendResponse(
           new BytesRestResponse(
               RestStatus.INTERNAL_SERVER_ERROR,
               "application/json",
               "{\"error\":\"" + escapeJson(e.getMessage()) + "\"}"));
+    }
+  }
+
+  private void resolveMappingsAndTriggerRefresh(String indexName, NodeClient nodeClient) {
+    Map<String, OpenSearchDataType> fieldTypes = Map.of();
+    try {
+      fieldTypes =
+          new OpenSearchDescribeIndexRequest(
+                  new OpenSearchNodeClient(nodeClient), new OpenSearchRequest.IndexName(indexName))
+              .getFieldTypes();
+    } catch (Exception e) {
+      LOG.debug(
+          "analyze: failed to resolve mappings for {} — proceeding with empty field map: {}",
+          indexName,
+          e.getMessage());
+    }
+    try {
+      collector.refreshAsync(indexName, fieldTypes);
+    } catch (Exception e) {
+      LOG.warn("Failed to trigger collector.refreshAsync for {}: {}", indexName, e.getMessage());
     }
   }
 

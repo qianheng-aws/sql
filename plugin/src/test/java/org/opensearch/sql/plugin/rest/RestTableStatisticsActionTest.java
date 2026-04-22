@@ -12,6 +12,7 @@ import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -44,6 +45,7 @@ import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.test.rest.FakeRestRequest;
+import org.opensearch.threadpool.ThreadPool;
 import org.opensearch.transport.client.node.NodeClient;
 
 /** Unit tests for {@link RestTableStatisticsAction}. */
@@ -59,6 +61,42 @@ public class RestTableStatisticsActionTest {
   @Before
   public void setUp() {
     action = new RestTableStatisticsAction(storage, collector);
+    // The handler dispatches mapping-fetch work to the generic pool. Stub the thread pool with
+    // a direct executor so the dispatched Runnable runs inline on the calling thread — otherwise
+    // tests race against the worker and can't verify collector interactions synchronously.
+    ThreadPool threadPool = mock(ThreadPool.class);
+    java.util.concurrent.ExecutorService sameThreadExecutor =
+        new java.util.concurrent.AbstractExecutorService() {
+          @Override
+          public void execute(Runnable command) {
+            command.run();
+          }
+
+          @Override
+          public void shutdown() {}
+
+          @Override
+          public java.util.List<Runnable> shutdownNow() {
+            return java.util.Collections.emptyList();
+          }
+
+          @Override
+          public boolean isShutdown() {
+            return false;
+          }
+
+          @Override
+          public boolean isTerminated() {
+            return false;
+          }
+
+          @Override
+          public boolean awaitTermination(long timeout, java.util.concurrent.TimeUnit unit) {
+            return true;
+          }
+        };
+    lenient().when(nodeClient.threadPool()).thenReturn(threadPool);
+    lenient().when(threadPool.generic()).thenReturn(sameThreadExecutor);
   }
 
   @Test
@@ -135,14 +173,20 @@ public class RestTableStatisticsActionTest {
 
   @Test
   @SuppressWarnings({"unchecked", "rawtypes"})
-  public void POST_analyze_usesEmptyFieldTypes() throws Exception {
+  public void POST_analyze_fallsBackToEmptyMapWhenMappingFetchFails() throws Exception {
+    // The mocked NodeClient can't service admin().indices().prepareGetMappings(...), so the
+    // handler's synchronous mapping resolution throws — the handler is expected to swallow that
+    // and still trigger the collector (with an empty map) rather than 500-ing the caller.
     FakeRestRequest request = newAnalyzeRequest("idx");
     MockRestChannel channel = new MockRestChannel(request);
     action.handleRequest(request, channel, nodeClient);
 
     ArgumentCaptor<Map> fieldTypesCaptor = ArgumentCaptor.forClass(Map.class);
     verify(collector).refreshAsync(eq("idx"), fieldTypesCaptor.capture());
-    assertTrue("fieldTypes should be empty", fieldTypesCaptor.getValue().isEmpty());
+    assertTrue(
+        "fieldTypes should be empty when mapping resolution fails",
+        fieldTypesCaptor.getValue().isEmpty());
+    assertEquals(RestStatus.ACCEPTED, channel.getResponse().status());
   }
 
   @Test
