@@ -55,6 +55,7 @@ import org.opensearch.sql.opensearch.storage.scan.OpenSearchIndexScanBuilder;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticDistinctRowCountHandler;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticSelectivityHandler;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
 import org.opensearch.sql.planner.DefaultImplementor;
 import org.opensearch.sql.planner.logical.LogicalAD;
@@ -310,11 +311,17 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
   }
 
   /**
-   * Expose a Calcite {@link BuiltInMetadata.DistinctRowCount.Handler} when a {@link TableStatistic}
-   * is available for this index. Calcite's {@code RelMdDistinctRowCount.getDistinctRowCount(
-   * TableScan, ...)} unwraps this handler type from the scan's table and, when present, delegates
-   * to it — which in turn lets {@code RelMdRowCount.getRowCount(Aggregate)} use real per-column
-   * cardinalities instead of falling back to {@code inputRowCount / 10}.
+   * Expose Calcite metadata handlers when a {@link TableStatistic} is available for this index.
+   * Calcite's {@code RelMd*} default implementations each call {@code scan.getTable().unwrap(
+   * Handler.class)} and delegate to the returned handler when present, so intercepting these
+   * classes lets the optimizer use real per-column stats instead of heuristic fallbacks.
+   *
+   * <ul>
+   *   <li>{@link BuiltInMetadata.DistinctRowCount.Handler} &rarr; aggregate rowcount uses stored
+   *       per-field cardinality (vs {@code inputRowCount / 10})
+   *   <li>{@link BuiltInMetadata.Selectivity.Handler} &rarr; filter selectivity uses stored
+   *       cardinality / null ratio (vs Calcite's {@code guessSelectivity} constants)
+   * </ul>
    */
   @Override
   public <C> @Nullable C unwrap(Class<C> aClass) {
@@ -322,6 +329,13 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
       Statistic stat = getStatistic();
       if (stat instanceof TableStatistic tableStat) {
         return aClass.cast(new TableStatisticDistinctRowCountHandler(tableStat));
+      }
+      return null;
+    }
+    if (aClass == BuiltInMetadata.Selectivity.Handler.class) {
+      Statistic stat = getStatistic();
+      if (stat instanceof TableStatistic tableStat) {
+        return aClass.cast(new TableStatisticSelectivityHandler(tableStat));
       }
       return null;
     }
