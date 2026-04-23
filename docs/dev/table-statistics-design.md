@@ -210,6 +210,24 @@ A beats B because Calcite asks selectivity 3–5× per planning session; a per-p
 
 C is the long-term answer (buckets absorb skew, µs lookup, ~1 KB/field, same sampler collection path just swap min/max → percentiles) but is deferred until multi-plan candidate generation (M3+) makes the accuracy matter. D costs the same to implement with no meaningful win over C because OpenSearch has BKD min/max at the Lucene level — ClickHouse chose t-digest partly because it doesn't. B may come back in M4 as a tie-breaker when the cost model is on a knife-edge between plans; paying the RPC only on those queries avoids the per-query tax.
 
+### 3.5 Cron refresh: scheduling architecture (M2 Phase 2)
+
+A background sweep that keeps stored stats within TTL. Five sub-decisions, each with the rejected alternatives recorded so we don't re-litigate them.
+
+| Decision | Chosen | Rejected | Why |
+|---|---|---|---|
+| Which node schedules | **Cluster-manager only**, via `LocalNodeClusterManagerListener` (same pattern as ILM / SLM) | (a) Every node runs its own tick, dedup via `GENERATING` marker; (b) `opensearch-job-scheduler` plugin, per-index job doc sharded across data nodes (alerting / ISM model) | (a) still races in the marker propagation window (~1-2 s), wasting duplicate searches; (b) would give automatic load-balancing and failover, but requires a new runtime dependency, a job-doc abstraction per index, and ~300 LOC of JobRunner plumbing — disproportionate for the O(100-index) scale we're targeting. Revisit (b) when index count pushes cluster-manager CPU past a threshold. |
+| What to enumerate | **Scan `.opensearch-statistics`** (only indices that already have a record) | Scan `ClusterState` (enumerate all user indices) | Cold-start (new index, never queried) is already handled by the miss path in `OpenSearchIndex.getStatistic()` — cron doesn't need to duplicate it. Scanning all indices would proactively build stats for cold / archived indices that nobody queries, wasting search slots. |
+| Tick lifecycle | **`LocalNodeClusterManagerListener.on/offClusterManager`** | (a) `ClusterStateListener` + checking `event.localNodeClusterManager()`; (b) timer-based self-check each tick | The listener interface was designed for exactly this use case — cleaner semantics than re-deriving the transition from cluster-state diffs, and strictly faster than waiting for the next tick to notice an identity flip. |
+| Concurrency throttle | **`Semaphore(N)` with `tryAcquire` → skip on contention** (N = `refresh_max_in_flight`, default 4) | (a) Bounded queue + dedicated worker loop; (b) custom thread pool | TTL is 24 h, tick interval is 60 s — skipped indices just get picked up next tick. No need for a queue, worker lifecycle, or backpressure. A queue would add value only if we needed to guarantee "every stale index is refreshed within one sweep," which TTL makes unnecessary. |
+| Search thread pool | **Share the default `search` pool**; on `EsRejectedExecutionException` skip (do **not** write a FAILED marker) | (a) Dedicated executor for cron refreshes; (b) priority / soft-deadline mechanism on `SearchRequest` | collector requests are `size=0 matchAll` with cheap aggs (~ms), throttled to 4 in-flight — negligible contention with user queries. A dedicated executor would only isolate the coordinating side; data-node execution would still land in each data node's `search` pool. Rejection-skip (instead of FAILED) matters because a busy cluster is not a stat-data problem; reusing the FAILED marker would poison the record and churn next tick. |
+
+**Settings (all dynamic, node-scope):**
+
+- `plugins.calcite.table_statistics.refresh_interval` — default `60s`
+- `plugins.calcite.table_statistics.ttl` — default `24h`
+- `plugins.calcite.table_statistics.refresh_max_in_flight` — default `4`, min `1`
+
 ---
 
 ## 4. Roadmap
@@ -306,6 +324,10 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-23 — M2 Phase 2 design finalized
+
+Scoped and aligned on the cron-refresh design. Decisions recorded in §3.5 (summary: cluster-manager-only scheduling via `LocalNodeClusterManagerListener`, scan `.opensearch-statistics` rather than `ClusterState`, `Semaphore(4)` throttle, share search pool with rejection-skip semantics). Three settings promoted from hardcoded: `refresh_interval`, `ttl`, `refresh_max_in_flight`. Notable rejected alternative: per-index job doc via `opensearch-job-scheduler` (alerting/ISM model) — gives automatic load-balancing at O(1k+) indices but is a disproportionate dependency to pull in at today's scale. Full spec at `docs/superpowers/specs/2026-04-23-table-statistics-cron-refresh-design.md`.
 
 ### 2026-04-23 — M2 Phase 1a + 1b shipped + consolidation
 
