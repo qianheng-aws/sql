@@ -114,6 +114,233 @@ class TableStatisticSelectivityHandlerTest {
     assertEquals(0.15, result, 1e-9);
   }
 
+  // ---- range ----
+
+  @Test
+  void greaterThan_linearOverMinMax() {
+    // latency ∈ [0, 1000], predicate latency > 750 → (1000-750)/(1000-0) = 0.25
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.GREATER_THAN,
+            REX.makeInputRef(INT, 0),
+            REX.makeExactLiteral(new java.math.BigDecimal(750)));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.25, result, 1e-9);
+  }
+
+  @Test
+  void greaterThanOrEqual_sameAsGreaterThan() {
+    // >= and > produce the same value at the resolution of the formula (1-row difference is
+    // below the uniform-distribution approximation's noise floor).
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.GREATER_THAN_OR_EQUAL,
+            REX.makeInputRef(INT, 0),
+            REX.makeExactLiteral(new java.math.BigDecimal(750)));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.25, result, 1e-9);
+  }
+
+  @Test
+  void lessThan_linearOverMinMax() {
+    // latency ∈ [0, 1000], predicate latency < 200 → (200-0)/(1000-0) = 0.2
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.LESS_THAN,
+            REX.makeInputRef(INT, 0),
+            REX.makeExactLiteral(new java.math.BigDecimal(200)));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.2, result, 1e-9);
+  }
+
+  @Test
+  void literalOnLeft_operatorFlipped() {
+    // "100 < latency" is equivalent to "latency > 100" — the handler must invert the operator
+    // when the column is on the right, otherwise it would compute (v - lo) / range = 0.1 instead
+    // of 0.9.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.LESS_THAN,
+            REX.makeExactLiteral(new java.math.BigDecimal(100)),
+            REX.makeInputRef(INT, 0));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.9, result, 1e-9);
+  }
+
+  @Test
+  void between_decomposedByCalcite_multipliesBothHalves() {
+    // Calcite usually rewrites BETWEEN as AND(>=, <=). We don't drive that rewrite here — we
+    // just verify the end-state: conjunct decomposition handles it, each half applies the
+    // range formula, result is their product.
+    // latency ∈ [0, 1000]; latency >= 200 AND latency <= 800.
+    // >= half: (1000-200)/1000 = 0.8; <= half: (800-0)/1000 = 0.8; product = 0.64.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.AND,
+            REX.makeCall(
+                SqlStdOperatorTable.GREATER_THAN_OR_EQUAL,
+                REX.makeInputRef(INT, 0),
+                REX.makeExactLiteral(new java.math.BigDecimal(200))),
+            REX.makeCall(
+                SqlStdOperatorTable.LESS_THAN_OR_EQUAL,
+                REX.makeInputRef(INT, 0),
+                REX.makeExactLiteral(new java.math.BigDecimal(800))));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.64, result, 1e-9);
+  }
+
+  @Test
+  void range_literalOutsideStoredRange_clampsToZeroOrOne() {
+    // latency ∈ [0, 1000], predicate latency > 2000 → below zero, clamp to 0.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+
+    Double gt =
+        new TableStatisticSelectivityHandler(stat)
+            .getSelectivity(
+                scan,
+                mockMq(),
+                REX.makeCall(
+                    SqlStdOperatorTable.GREATER_THAN,
+                    REX.makeInputRef(INT, 0),
+                    REX.makeExactLiteral(new java.math.BigDecimal(2000))));
+    assertEquals(0.0, gt, 1e-9);
+
+    // predicate latency > -500 → above one, clamp to 1.
+    Double gt2 =
+        new TableStatisticSelectivityHandler(stat)
+            .getSelectivity(
+                scan,
+                mockMq(),
+                REX.makeCall(
+                    SqlStdOperatorTable.GREATER_THAN,
+                    REX.makeInputRef(INT, 0),
+                    REX.makeExactLiteral(new java.math.BigDecimal(-500))));
+    assertEquals(1.0, gt2, 1e-9);
+  }
+
+  @Test
+  void range_missingMinMax_fallsBackToGuess() {
+    // No stored min/max on the field (e.g. keyword column we haven't started storing ranges for).
+    // The handler must return null for this conjunct so the outer loop falls back to
+    // RelMdUtil.guessSelectivity, which for range predicates is 0.5.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, null, null, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.GREATER_THAN,
+            REX.makeInputRef(INT, 0),
+            REX.makeExactLiteral(new java.math.BigDecimal(750)));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.5, result, 1e-9);
+  }
+
+  @Test
+  void range_sargExpanded_bothBoundsContribute() {
+    // Calcite's RexSimplify collapses "x > 200 AND x < 800" into SEARCH(x, Sarg[(200..800)]).
+    // Our handler calls RexUtil.expandSearch first, so the two bounds are re-decomposed and
+    // each applies the stat-backed formula.
+    // latency ∈ [0, 1000]. > 200 → (1000-200)/1000 = 0.8. < 800 → (800-0)/1000 = 0.8. Product 0.64.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("latency", new FieldStatistic("long", 800L, 0, 1000, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("latency"), List.of(INT));
+    RexNode original =
+        REX.makeCall(
+            SqlStdOperatorTable.AND,
+            REX.makeCall(
+                SqlStdOperatorTable.GREATER_THAN,
+                REX.makeInputRef(INT, 0),
+                REX.makeExactLiteral(new java.math.BigDecimal(200))),
+            REX.makeCall(
+                SqlStdOperatorTable.LESS_THAN,
+                REX.makeInputRef(INT, 0),
+                REX.makeExactLiteral(new java.math.BigDecimal(800))));
+    // Simulate what Calcite's RexSimplify would produce by running it through the simplifier.
+    RexNode simplified =
+        new org.apache.calcite.rex.RexSimplify(
+                REX,
+                org.apache.calcite.plan.RelOptPredicateList.EMPTY,
+                org.apache.calcite.rex.RexUtil.EXECUTOR)
+            .simplify(original);
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), simplified);
+
+    assertEquals(0.64, result, 1e-9);
+  }
+
+  @Test
+  void range_singleValueColumn_fallsBackToGuess() {
+    // When min == max the formula would divide by zero — handler returns null, caller falls
+    // back to guessSelectivity.
+    TableStatistic stat =
+        TableStatistic.fromFields(
+            100L, Map.of("k", new FieldStatistic("long", 1L, 42, 42, List.of(), 0.0)));
+
+    TableScan scan = mockScan(List.of("k"), List.of(INT));
+    RexNode predicate =
+        REX.makeCall(
+            SqlStdOperatorTable.GREATER_THAN,
+            REX.makeInputRef(INT, 0),
+            REX.makeExactLiteral(new java.math.BigDecimal(50)));
+
+    Double result =
+        new TableStatisticSelectivityHandler(stat).getSelectivity(scan, mockMq(), predicate);
+
+    assertEquals(0.5, result, 1e-9);
+  }
+
   // ---- null / not-null ----
 
   @Test
@@ -261,6 +488,12 @@ class TableStatisticSelectivityHandlerTest {
     TableScan scan = mock(TableScan.class);
     RelOptTable table = mock(RelOptTable.class);
     RelDataType rowType = mock(RelDataType.class);
+    // RexUtil.expandSearch in the handler needs a real RexBuilder reachable through
+    // scan.getCluster().getRexBuilder() — provide a mock cluster that returns the static REX.
+    org.apache.calcite.plan.RelOptCluster cluster =
+        mock(org.apache.calcite.plan.RelOptCluster.class);
+    lenient().when(cluster.getRexBuilder()).thenReturn(REX);
+    lenient().when(scan.getCluster()).thenReturn(cluster);
     lenient().when(scan.getTable()).thenReturn(table);
     lenient().when(scan.getRowType()).thenReturn(rowType);
     lenient().when(rowType.getFieldList()).thenReturn(new FieldList(fieldNames, fieldTypes));

@@ -245,15 +245,15 @@ M2 is split into phases by ROI and implementation cost.
 
 *(Earlier plan routed min/max through a self-built broadcast reader over `IndexShard.acquireSearcher`. The spike proved the Lucene short-circuit exists, but it also turns out `MinAggregator` / `MaxAggregator` already use that short-circuit, so lifting them out of the sampler is enough — we never needed the broadcast.)*
 
-#### Phase 1b — Wire range selectivity into `TableStatisticSelectivityHandler`
+#### Phase 1b — Range selectivity in `TableStatisticSelectivityHandler` (DONE)
 
-- [ ] Extend the handler to recognize `GREATER_THAN`, `GREATER_THAN_OR_EQUAL`, `LESS_THAN`, `LESS_THAN_OR_EQUAL`, `BETWEEN`.
-- [ ] Delegate to `FieldStatistic.rangeSelectivity(low, high)` (existing).
-- [ ] Handle `RexLiteral` → numeric/date coercion. Defer string ranges until we store min/max for keyword fields.
-- [ ] Unit tests on each predicate kind + `_explain?format=cost` cluster verify.
-- [ ] **Known limitation, documented in code + user docs:** uniform-distribution assumption produces bad estimates for skewed data (§3.4). Histogram is the fix, deferred to later milestone.
+- [x] Handle `>`, `>=`, `<`, `<=` via linear interpolation over stored `[min, max]`. Literal-on-left form flips the operator. Single-value columns and missing stored min/max fall back to Calcite's `guessSelectivity`.
+- [x] `RexLiteral.getValueAs(Number.class)` for literal coercion — works for numeric and date-epoch-millis. String ranges deferred (we don't collect keyword min/max yet).
+- [x] `RexUtil.expandSearch` at the top of `getSelectivity` — Calcite's `RexSimplify` collapses multiple comparisons on the same column into `SEARCH(col, Sarg[...])`, and without expansion the conjunct decomposition would treat the whole Sarg as one opaque predicate. Expanding first means `BETWEEN` (and any `AND(<=, >=)` on the same column) gets the stat-backed treatment on both bounds.
+- [x] Unit tests: 8 new cases covering `>`, `>=`, `<`, `<=`, literal-on-left, outside-range clamp, missing stats, single-value column, SEARCH/Sarg expansion.
+- [x] Live verify on `poc-v4` (`latency ∈ [7, 996]`, 137 docs): `latency > 500` → `rowcount 68.71`; `latency < 200` → `26.74`; `latency BETWEEN 200 AND 800` → `88.41`; `latency > 200 AND latency < 800 AND status = 'OK'` → `17.68`. All match the expected `doc_count × stat_selectivity` product to 3 decimals.
 
-**ROI:** zero latency cost, takes effect the moment Phase 1a lands accurate min/max. No blast radius — worst case (skew) falls back to being no worse than Calcite defaults.
+**Known limitation:** uniform-distribution assumption is poor on skewed data (see §3.4). Histogram support is the fix; gated on multi-plan candidate generation in M3+.
 
 #### Phase 2 — Cron-driven refresh
 
@@ -277,11 +277,11 @@ M2 is split into phases by ROI and implementation cost.
 
 ### Milestone 3 — Consumer-side (optimizer integration)
 
-These were captured in the POC plan's "Consumer-side Future Work" section. #2 and #3-equality are done; the rest are open.
+These were captured in the POC plan's "Consumer-side Future Work" section. #2 and #3 (equality+null+range) are done; the rest are open.
 
 - [x] **#2 Aggregate row count** — `DistinctRowCount.Handler` via `unwrap`. Shipped (`eef8697c1`).
 - [x] **#3 Filter selectivity (equality/null)** — `Selectivity.Handler` via `unwrap`. Shipped (`545bc7d63`): `col = literal → 1/cardinality`, `IS NULL → nullRatio`, `IS NOT NULL → 1 - nullRatio`.
-- [ ] **#3 Filter selectivity (range)** — see M2 Phase 1b above.
+- [x] **#3 Filter selectivity (range)** — M2 Phase 1b, linear interpolation over stored `[min, max]` + `RexUtil.expandSearch` for `BETWEEN` / Sarg.
 - [ ] **#1 TableScan row count override.** Right now `AbstractCalciteIndexScan.estimateRowCount` reads `TableStatistic.getRowCount()` via `getStatistic()`. That is good. But `maxResultWindow` is still the fallback — promote the stored `doc_count` higher up so even non-Calcite paths benefit.
 - [ ] **#4 Histogram-backed selectivity** — replace the uniform-distribution min/max formula with equi-height histograms (~50 buckets per numeric/date field). See §3.4. Gated on real ROI, expected to be driven by multi-plan candidate generation in JOIN scenarios.
 - [ ] **#5 Join reorder hints.** With both sides carrying stats, we can reorder joins by smaller-input-first. Requires the metadata handlers above plus verified handling of non-null join predicates.
@@ -307,9 +307,10 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
 
-### 2026-04-23 — M2 Phase 1a shipped + consolidation
+### 2026-04-23 — M2 Phase 1a + 1b shipped + consolidation
 
 - **Phase 1a (exact min/max).** Original plan was to build a `ShardRegistry` + broadcast transport action so the collector could drive `PointValues.getMin/MaxPackedValue` directly from each node's Lucene segments. On re-reading the aggregation framework, realized `MinAggregator` / `MaxAggregator` already call those same BKD APIs — the only reason our old results looked sampled was that we'd nested them under the sampler. Pulled min/max out to top-level aggregations, kept cardinality under the sampler. ~50 LOC change instead of ~400. `spike-big` (50 k docs) now reports `latency ∈ [0, 999]` (exact) — previously sampler-bounded. Deleted the spike code and the `onIndexModule` wiring now that we no longer need direct shard access.
+- **Phase 1b (range selectivity).** Extended `TableStatisticSelectivityHandler` to handle `>`, `>=`, `<`, `<=` via linear interpolation over stored `[min, max]`. Landmine surfaced during the cluster verify: Calcite's `RexSimplify` collapses `x > 200 AND x < 800` into `SEARCH(x, Sarg[(200..800)])`, which made the handler see the whole range as one opaque conjunct and return a useless 0.25 guess. Fix: call `RexUtil.expandSearch` at the top of `getSelectivity` before conjunct decomposition. Without this, Phase 1b would only have fired on single-sided predicates (`x > 500`) — in practice most range queries are two-sided, so the expansion is load-bearing. Live verify on `poc-v4`: `latency BETWEEN 200 AND 800` → `rowcount 88.41` (was `34.25` from guess); `latency > 200 AND latency < 800 AND status = 'OK'` → `17.68` (mixes three stat-backed factors).
 - **Doc.** Collected the scattered decision rationale from session transcripts, plan files, and commit messages into this document. Extended with explicit rejection analysis for three calls that had only been discussed ad-hoc: storing HLL sketch bytes (§3.2), cron vs refresh-listener (§3.3), and range-selectivity estimation (§3.4). Rewrote M2 into explicit phases.
 
 ### 2026-04-22 — Spike: Lucene segment reads from a plugin
