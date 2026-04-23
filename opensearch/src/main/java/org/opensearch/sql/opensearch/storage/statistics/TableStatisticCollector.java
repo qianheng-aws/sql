@@ -33,9 +33,22 @@ import org.opensearch.sql.opensearch.data.type.OpenSearchTextType;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
- * Orchestrates asynchronous table-statistic collection: builds a single sampler-backed aggregation
- * request covering the whole flattened field schema, sends it to {@link NodeClient}, and persists
- * the parsed {@link TableStatistic} into {@link TableStatisticStorage}.
+ * Orchestrates asynchronous table-statistic collection: builds an aggregation request covering the
+ * whole flattened field schema, sends it to {@link NodeClient}, and persists the parsed {@link
+ * TableStatistic} into {@link TableStatisticStorage}.
+ *
+ * <p>Aggregation shape:
+ *
+ * <ul>
+ *   <li>Cardinality (HLL, approximate distinct count) is wrapped in a {@link
+ *       SamplerAggregationBuilder sampler} so per-shard work is bounded by {@link
+ *       #SAMPLER_SHARD_SIZE} documents.
+ *   <li>Min / max are <b>top-level</b> aggregations (not under the sampler). Lucene's {@code
+ *       MinAggregator} / {@code MaxAggregator} short-circuit to {@code
+ *       PointValues.getMinPackedValue} / {@code getMaxPackedValue} on numeric / date fields, so
+ *       they are O(1) per segment regardless of doc count — cheap enough to read exactly instead of
+ *       approximating from a sample.
+ * </ul>
  *
  * <p>The single public entrypoint {@link #refreshAsync(String, Map)} is fire-and-forget; internal
  * steps chain via {@link ActionListener}s. Race-protection is enforced by reading the raw stored
@@ -207,8 +220,9 @@ public class TableStatisticCollector {
   }
 
   /**
-   * Build the sampler-wrapped aggregation request covering every eligible field. See class javadoc
-   * for field-type handling.
+   * Build the aggregation request covering every eligible field. Cardinality goes inside a sampler
+   * (bounded per-shard cost); min/max are top-level (Lucene BKD short-circuit, O(1) per segment).
+   * See class javadoc for the full shape and field-type handling.
    */
   SearchRequest buildAggregationRequest(
       String indexName, Map<String, OpenSearchDataType> fieldTypes) {
@@ -216,6 +230,9 @@ public class TableStatisticCollector {
 
     SamplerAggregationBuilder samplerAgg =
         AggregationBuilders.sampler(SAMPLER_AGG).shardSize(SAMPLER_SHARD_SIZE);
+
+    SearchSourceBuilder source =
+        new SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).size(0).trackTotalHits(true);
 
     for (Map.Entry<String, OpenSearchDataType> entry : flat.entrySet()) {
       String name = entry.getKey();
@@ -250,15 +267,14 @@ public class TableStatisticCollector {
             AggregationBuilders.cardinality(CARDINALITY_PREFIX + name).field(aggField));
       }
       if (doMinMax) {
-        samplerAgg.subAggregation(AggregationBuilders.min(MIN_PREFIX + name).field(aggField));
-        samplerAgg.subAggregation(AggregationBuilders.max(MAX_PREFIX + name).field(aggField));
+        source.aggregation(AggregationBuilders.min(MIN_PREFIX + name).field(aggField));
+        source.aggregation(AggregationBuilders.max(MAX_PREFIX + name).field(aggField));
       }
     }
 
-    SearchSourceBuilder source =
-        new SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).size(0).trackTotalHits(true);
-    // Sampler with zero sub-aggregations is rejected by OpenSearch ("all shards failed").
-    // Skip the sampler when no fields are eligible — we still get the trackTotalHits doc_count.
+    // Sampler with zero sub-aggregations is rejected by OpenSearch ("all shards failed"), so add
+    // it only when at least one cardinality sub-agg exists. When no fields are eligible we still
+    // get the trackTotalHits doc_count.
     if (!samplerAgg.getSubAggregations().isEmpty()) {
       source.aggregation(samplerAgg);
     }
@@ -266,31 +282,30 @@ public class TableStatisticCollector {
   }
 
   /**
-   * Extract the per-field statistics from the sampler's sub-aggregations and combine with the total
-   * hit count to produce a {@link TableStatistic}. When the sampler aggregation is missing from the
-   * response, returns a statistic with just {@code docCount} populated and no fields.
+   * Extract per-field statistics and combine with the total hit count to produce a {@link
+   * TableStatistic}. Cardinality is read from the sampler's sub-aggregations; min/max are read from
+   * the top-level aggregations. Missing aggregations for a field (e.g. unsupported type) result in
+   * the field being omitted from the output.
    */
   TableStatistic parseSearchResponse(
       SearchResponse response, Map<String, OpenSearchDataType> fieldTypes) {
     long docCount = response.getHits().getTotalHits().value();
 
     Aggregations topAggs = response.getAggregations();
-    Object rawSampler = topAggs == null ? null : topAggs.get(SAMPLER_AGG);
-    if (rawSampler != null && !(rawSampler instanceof InternalSampler)) {
-      LOG.warn(
-          "Expected sampler aggregation at '{}' but got {}",
-          SAMPLER_AGG,
-          rawSampler.getClass().getSimpleName());
-      return TableStatistic.fromFields(docCount, Collections.emptyMap());
-    }
-    InternalSampler sampler = (InternalSampler) rawSampler;
-    if (sampler == null) {
-      return TableStatistic.fromFields(docCount, Collections.emptyMap());
+    InternalAggregations samplerSubAggs = null;
+    if (topAggs != null) {
+      Object rawSampler = topAggs.get(SAMPLER_AGG);
+      if (rawSampler instanceof InternalSampler sampler) {
+        samplerSubAggs = sampler.getAggregations();
+      } else if (rawSampler != null) {
+        LOG.warn(
+            "Expected sampler aggregation at '{}' but got {}",
+            SAMPLER_AGG,
+            rawSampler.getClass().getSimpleName());
+      }
     }
 
-    InternalAggregations subAggs = sampler.getAggregations();
     Map<String, OpenSearchDataType> flat = OpenSearchDataType.traverseAndFlatten(fieldTypes);
-
     Map<String, FieldStatistic> fields = new LinkedHashMap<>();
     for (Map.Entry<String, OpenSearchDataType> entry : flat.entrySet()) {
       String name = entry.getKey();
@@ -300,9 +315,10 @@ public class TableStatisticCollector {
         continue;
       }
 
-      InternalCardinality card = subAggs == null ? null : subAggs.get(CARDINALITY_PREFIX + name);
-      InternalMin min = subAggs == null ? null : subAggs.get(MIN_PREFIX + name);
-      InternalMax max = subAggs == null ? null : subAggs.get(MAX_PREFIX + name);
+      InternalCardinality card =
+          samplerSubAggs == null ? null : samplerSubAggs.get(CARDINALITY_PREFIX + name);
+      InternalMin min = topAggs == null ? null : topAggs.get(MIN_PREFIX + name);
+      InternalMax max = topAggs == null ? null : topAggs.get(MAX_PREFIX + name);
 
       if (card == null && min == null && max == null) {
         // No aggregation was requested for this field (e.g. unsupported type).

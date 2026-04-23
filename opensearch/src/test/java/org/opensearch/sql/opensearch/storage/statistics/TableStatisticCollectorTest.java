@@ -87,66 +87,80 @@ class TableStatisticCollectorTest {
     assertEquals(0, source.size(), "expected size=0");
     assertTrue(source.trackTotalHitsUpTo() != null, "expected trackTotalHits to be set");
 
-    // Top-level aggregation is the sampler
-    assertEquals(1, source.aggregations().getAggregatorFactories().size());
-    AggregationBuilder top = source.aggregations().getAggregatorFactories().iterator().next();
-    assertTrue(
-        top instanceof SamplerAggregationBuilder,
-        "top-level aggregation should be sampler, got " + top.getClass());
-    SamplerAggregationBuilder sampler = (SamplerAggregationBuilder) top;
-    assertEquals(TableStatisticCollector.SAMPLER_AGG, sampler.getName());
+    // Collect top-level aggregations by name, locate the sampler among them
+    Map<String, AggregationBuilder> topLevel = new LinkedHashMap<>();
+    SamplerAggregationBuilder sampler = null;
+    for (AggregationBuilder agg : source.aggregations().getAggregatorFactories()) {
+      topLevel.put(agg.getName(), agg);
+      if (agg instanceof SamplerAggregationBuilder sa
+          && TableStatisticCollector.SAMPLER_AGG.equals(sa.getName())) {
+        sampler = sa;
+      }
+    }
+    assertNotNull(sampler, "sampler should be present for cardinality sub-aggs");
     assertEquals(100_000, sampler.shardSize());
 
-    Map<String, AggregationBuilder> subs = new LinkedHashMap<>();
+    Map<String, AggregationBuilder> samplerSubs = new LinkedHashMap<>();
     for (AggregationBuilder sub : sampler.getSubAggregations()) {
-      subs.put(sub.getName(), sub);
+      samplerSubs.put(sub.getName(), sub);
     }
 
     // status (keyword): cardinality only
     assertTrue(
-        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "status"),
-        "cardinality for status");
+        samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "status"),
+        "cardinality for status (sampler sub-agg)");
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "status"),
+        !topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "status"),
         "no min for keyword status");
 
-    // latency (long): cardinality + min + max
+    // latency (long): cardinality in sampler, min/max top-level
     assertTrue(
-        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "latency"),
-        "cardinality for latency");
-    assertTrue(subs.containsKey(TableStatisticCollector.MIN_PREFIX + "latency"), "min for latency");
-    assertTrue(subs.containsKey(TableStatisticCollector.MAX_PREFIX + "latency"), "max for latency");
+        samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "latency"),
+        "cardinality for latency (sampler sub-agg)");
+    assertTrue(
+        topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "latency"),
+        "min for latency (top-level)");
+    assertTrue(
+        topLevel.containsKey(TableStatisticCollector.MAX_PREFIX + "latency"),
+        "max for latency (top-level)");
+    assertTrue(
+        !samplerSubs.containsKey(TableStatisticCollector.MIN_PREFIX + "latency"),
+        "min must NOT be under sampler");
 
     // message (text w/ .keyword): cardinality only (on .keyword sub-field)
     assertTrue(
-        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "message"),
+        samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "message"),
         "cardinality for message");
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "message"), "no min for text");
+        !topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "message"), "no min for text");
 
     // raw_text (text w/o keyword sub-field): skipped
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "raw_text"),
+        !samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "raw_text"),
         "raw_text text without keyword should be skipped");
 
-    // @timestamp (date): min + max only (no cardinality)
+    // @timestamp (date): min + max top-level, no cardinality
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "@timestamp"),
+        !samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "@timestamp"),
         "no cardinality for date");
-    assertTrue(subs.containsKey(TableStatisticCollector.MIN_PREFIX + "@timestamp"), "min for date");
-    assertTrue(subs.containsKey(TableStatisticCollector.MAX_PREFIX + "@timestamp"), "max for date");
+    assertTrue(
+        topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "@timestamp"),
+        "min for date (top-level)");
+    assertTrue(
+        topLevel.containsKey(TableStatisticCollector.MAX_PREFIX + "@timestamp"),
+        "max for date (top-level)");
 
     // active (boolean): skipped
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "active"),
+        !samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "active"),
         "boolean should be skipped");
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.MIN_PREFIX + "active"),
+        !topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "active"),
         "boolean should be skipped");
 
     // obj (object): skipped
     assertTrue(
-        !subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "obj"),
+        !samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "obj"),
         "object should be skipped");
   }
 
@@ -254,24 +268,31 @@ class TableStatisticCollectorTest {
     InternalMax latencyMax = mock(InternalMax.class);
     when(latencyMax.getValue()).thenReturn(999.0);
 
-    InternalAggregations subAggs = mock(InternalAggregations.class);
+    // Cardinality lives inside the sampler
+    InternalAggregations samplerSubs = mock(InternalAggregations.class);
     lenient()
-        .when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "status"))
+        .when(samplerSubs.get(TableStatisticCollector.CARDINALITY_PREFIX + "status"))
         .thenReturn(statusCard);
     lenient()
-        .when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency"))
+        .when(samplerSubs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency"))
         .thenReturn(latencyCard);
-    lenient()
-        .when(subAggs.get(TableStatisticCollector.MIN_PREFIX + "latency"))
-        .thenReturn(latencyMin);
-    lenient()
-        .when(subAggs.get(TableStatisticCollector.MAX_PREFIX + "latency"))
-        .thenReturn(latencyMax);
 
     InternalSampler sampler = mock(InternalSampler.class);
-    when(sampler.getAggregations()).thenReturn(subAggs);
+    when(sampler.getAggregations()).thenReturn(samplerSubs);
 
-    SearchResponse response = buildResponse(123L, sampler);
+    // min/max live at the top level. Use lenient() because the parser also calls
+    // topLevel.get("min_status")/"max_status" for the keyword field (returns null → omitted),
+    // and Mockito's default strictness would flag those as unexpected stubs.
+    Aggregations topLevel = mock(Aggregations.class);
+    lenient().when(topLevel.get(TableStatisticCollector.SAMPLER_AGG)).thenReturn(sampler);
+    lenient()
+        .when(topLevel.get(TableStatisticCollector.MIN_PREFIX + "latency"))
+        .thenReturn(latencyMin);
+    lenient()
+        .when(topLevel.get(TableStatisticCollector.MAX_PREFIX + "latency"))
+        .thenReturn(latencyMax);
+
+    SearchResponse response = buildResponseWithTopAggs(123L, topLevel);
 
     Map<String, OpenSearchDataType> fieldTypes = new LinkedHashMap<>();
     fieldTypes.put("status", OpenSearchDataType.of(MappingType.Keyword));
@@ -313,15 +334,18 @@ class TableStatisticCollectorTest {
     InternalMax max = mock(InternalMax.class);
     when(max.getValue()).thenReturn(Double.NEGATIVE_INFINITY);
 
-    InternalAggregations subAggs = mock(InternalAggregations.class);
-    when(subAggs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency")).thenReturn(card);
-    when(subAggs.get(TableStatisticCollector.MIN_PREFIX + "latency")).thenReturn(min);
-    when(subAggs.get(TableStatisticCollector.MAX_PREFIX + "latency")).thenReturn(max);
+    InternalAggregations samplerSubs = mock(InternalAggregations.class);
+    when(samplerSubs.get(TableStatisticCollector.CARDINALITY_PREFIX + "latency")).thenReturn(card);
 
     InternalSampler sampler = mock(InternalSampler.class);
-    when(sampler.getAggregations()).thenReturn(subAggs);
+    when(sampler.getAggregations()).thenReturn(samplerSubs);
 
-    SearchResponse response = buildResponse(10L, sampler);
+    Aggregations topLevel = mock(Aggregations.class);
+    when(topLevel.get(TableStatisticCollector.SAMPLER_AGG)).thenReturn(sampler);
+    when(topLevel.get(TableStatisticCollector.MIN_PREFIX + "latency")).thenReturn(min);
+    when(topLevel.get(TableStatisticCollector.MAX_PREFIX + "latency")).thenReturn(max);
+
+    SearchResponse response = buildResponseWithTopAggs(10L, topLevel);
     Map<String, OpenSearchDataType> fieldTypes =
         Map.of("latency", OpenSearchDataType.of(MappingType.Long));
 
@@ -345,26 +369,34 @@ class TableStatisticCollectorTest {
     fieldTypes.put("user.age", OpenSearchDataType.of(MappingType.Integer));
 
     SearchRequest request = collector.buildAggregationRequest("nested-idx", fieldTypes);
-    SamplerAggregationBuilder sampler =
-        (SamplerAggregationBuilder)
-            request.source().aggregations().getAggregatorFactories().iterator().next();
-    Map<String, AggregationBuilder> subs = new LinkedHashMap<>();
+
+    Map<String, AggregationBuilder> topLevel = new LinkedHashMap<>();
+    SamplerAggregationBuilder sampler = null;
+    for (AggregationBuilder agg : request.source().aggregations().getAggregatorFactories()) {
+      topLevel.put(agg.getName(), agg);
+      if (agg instanceof SamplerAggregationBuilder sa
+          && TableStatisticCollector.SAMPLER_AGG.equals(sa.getName())) {
+        sampler = sa;
+      }
+    }
+    assertNotNull(sampler, "sampler must exist for cardinality sub-aggs");
+    Map<String, AggregationBuilder> samplerSubs = new LinkedHashMap<>();
     for (AggregationBuilder b : sampler.getSubAggregations()) {
-      subs.put(b.getName(), b);
+      samplerSubs.put(b.getName(), b);
     }
 
     assertTrue(
-        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.name"),
+        samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.name"),
         "cardinality sub-agg name must include the dotted path");
     assertTrue(
-        subs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.age"),
+        samplerSubs.containsKey(TableStatisticCollector.CARDINALITY_PREFIX + "user.age"),
         "cardinality sub-agg name must include the dotted path");
     assertTrue(
-        subs.containsKey(TableStatisticCollector.MIN_PREFIX + "user.age"),
-        "min sub-agg name must include the dotted path");
+        topLevel.containsKey(TableStatisticCollector.MIN_PREFIX + "user.age"),
+        "top-level min name must include the dotted path");
     assertTrue(
-        subs.containsKey(TableStatisticCollector.MAX_PREFIX + "user.age"),
-        "max sub-agg name must include the dotted path");
+        topLevel.containsKey(TableStatisticCollector.MAX_PREFIX + "user.age"),
+        "top-level max name must include the dotted path");
   }
 
   @Test
@@ -399,6 +431,19 @@ class TableStatisticCollectorTest {
     when(response.getHits()).thenReturn(hits);
     Aggregations topLevel = mock(Aggregations.class);
     when(topLevel.get(TableStatisticCollector.SAMPLER_AGG)).thenReturn(sampler);
+    when(response.getAggregations()).thenReturn(topLevel);
+    return response;
+  }
+
+  /** Variant that lets the caller supply a pre-configured top-level {@link Aggregations}. */
+  private SearchResponse buildResponseWithTopAggs(long totalHits, Aggregations topLevel) {
+    SearchResponse response = mock(SearchResponse.class);
+    SearchHits hits =
+        new SearchHits(
+            new org.opensearch.search.SearchHit[0],
+            new TotalHits(totalHits, TotalHits.Relation.EQUAL_TO),
+            1.0F);
+    when(response.getHits()).thenReturn(hits);
     when(response.getAggregations()).thenReturn(topLevel);
     return response;
   }
