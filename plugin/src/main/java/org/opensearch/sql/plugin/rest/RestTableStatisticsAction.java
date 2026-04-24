@@ -18,13 +18,11 @@ import org.opensearch.rest.BaseRestHandler;
 import org.opensearch.rest.BytesRestResponse;
 import org.opensearch.rest.RestChannel;
 import org.opensearch.rest.RestRequest;
-import org.opensearch.sql.opensearch.client.OpenSearchNodeClient;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
-import org.opensearch.sql.opensearch.request.OpenSearchRequest;
-import org.opensearch.sql.opensearch.request.system.OpenSearchDescribeIndexRequest;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticsMappingResolver;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -160,18 +158,8 @@ public class RestTableStatisticsAction extends BaseRestHandler {
   }
 
   private void resolveMappingsAndTriggerRefresh(String indexName, NodeClient nodeClient) {
-    Map<String, OpenSearchDataType> fieldTypes = Map.of();
-    try {
-      fieldTypes =
-          new OpenSearchDescribeIndexRequest(
-                  new OpenSearchNodeClient(nodeClient), new OpenSearchRequest.IndexName(indexName))
-              .getFieldTypes();
-    } catch (Exception e) {
-      LOG.debug(
-          "analyze: failed to resolve mappings for {} — proceeding with empty field map: {}",
-          indexName,
-          e.getMessage());
-    }
+    Map<String, OpenSearchDataType> fieldTypes =
+        new TableStatisticsMappingResolver(nodeClient).resolve(indexName);
     try {
       collector.refreshAsync(indexName, fieldTypes);
     } catch (Exception e) {
