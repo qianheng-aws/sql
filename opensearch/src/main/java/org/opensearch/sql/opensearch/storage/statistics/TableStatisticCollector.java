@@ -29,6 +29,7 @@ import org.opensearch.search.aggregations.bucket.sampler.SamplerAggregationBuild
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.search.aggregations.metrics.InternalMax;
 import org.opensearch.search.aggregations.metrics.InternalMin;
+import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType.MappingType;
@@ -75,6 +76,7 @@ public class TableStatisticCollector {
   static final String CARDINALITY_PREFIX = "cardinality_";
   static final String MIN_PREFIX = "min_";
   static final String MAX_PREFIX = "max_";
+  static final String COUNT_PREFIX = "count_";
 
   /**
    * Field types for which an approximate-distinct-count (cardinality) aggregation is meaningful.
@@ -331,6 +333,9 @@ public class TableStatisticCollector {
         source.aggregation(AggregationBuilders.min(MIN_PREFIX + name).field(aggField));
         source.aggregation(AggregationBuilders.max(MAX_PREFIX + name).field(aggField));
       }
+      if (doCardinality || doMinMax) {
+        source.aggregation(AggregationBuilders.count(COUNT_PREFIX + name).field(aggField));
+      }
     }
 
     // Sampler with zero sub-aggregations is rejected by OpenSearch ("all shards failed"), so add
@@ -380,8 +385,9 @@ public class TableStatisticCollector {
           samplerSubAggs == null ? null : samplerSubAggs.get(CARDINALITY_PREFIX + name);
       InternalMin min = topAggs == null ? null : topAggs.get(MIN_PREFIX + name);
       InternalMax max = topAggs == null ? null : topAggs.get(MAX_PREFIX + name);
+      InternalValueCount count = topAggs == null ? null : topAggs.get(COUNT_PREFIX + name);
 
-      if (card == null && min == null && max == null) {
+      if (card == null && min == null && max == null && count == null) {
         // No aggregation was requested for this field (e.g. unsupported type).
         continue;
       }
@@ -389,11 +395,16 @@ public class TableStatisticCollector {
       long cardinality = card == null ? 0L : card.getValue();
       Object minValue = min == null || Double.isInfinite(min.getValue()) ? null : min.getValue();
       Object maxValue = max == null || Double.isInfinite(max.getValue()) ? null : max.getValue();
+      double nullRatio = 0.0;
+      if (count != null && docCount > 0) {
+        double computed = 1.0 - ((double) count.getValue() / (double) docCount);
+        nullRatio = computed < 0.0 ? 0.0 : computed;
+      }
 
       fields.put(
           name,
           new FieldStatistic(
-              mt.toString(), cardinality, minValue, maxValue, Collections.emptyList(), 0.0));
+              mt.toString(), cardinality, minValue, maxValue, Collections.emptyList(), nullRatio));
     }
 
     return TableStatistic.fromFields(docCount, fields);

@@ -47,6 +47,7 @@ import org.opensearch.search.aggregations.bucket.sampler.SamplerAggregationBuild
 import org.opensearch.search.aggregations.metrics.InternalCardinality;
 import org.opensearch.search.aggregations.metrics.InternalMax;
 import org.opensearch.search.aggregations.metrics.InternalMin;
+import org.opensearch.search.aggregations.metrics.InternalValueCount;
 import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType;
 import org.opensearch.sql.opensearch.data.type.OpenSearchDataType.MappingType;
@@ -361,6 +362,60 @@ class TableStatisticCollectorTest {
     assertNotNull(latency);
     assertNull(latency.minValue(), "POSITIVE_INFINITY should map to null");
     assertNull(latency.maxValue(), "NEGATIVE_INFINITY should map to null");
+  }
+
+  @Test
+  void parseSearchResponsePopulatesNullRatio() {
+    // foo: value_count=80 against totalHits=100 → null_ratio = 0.2
+    InternalCardinality fooCard = mock(InternalCardinality.class);
+    lenient().when(fooCard.getValue()).thenReturn(10L);
+    InternalMin fooMin = mock(InternalMin.class);
+    lenient().when(fooMin.getValue()).thenReturn(0.0);
+    InternalMax fooMax = mock(InternalMax.class);
+    lenient().when(fooMax.getValue()).thenReturn(50.0);
+    InternalValueCount fooCount = mock(InternalValueCount.class);
+    lenient().when(fooCount.getValue()).thenReturn(80L);
+
+    // bar: multi-valued, value_count=150 > docCount=100 → clamp to 0.0
+    InternalCardinality barCard = mock(InternalCardinality.class);
+    lenient().when(barCard.getValue()).thenReturn(7L);
+    InternalMin barMin = mock(InternalMin.class);
+    lenient().when(barMin.getValue()).thenReturn(1.0);
+    InternalMax barMax = mock(InternalMax.class);
+    lenient().when(barMax.getValue()).thenReturn(9.0);
+    InternalValueCount barCount = mock(InternalValueCount.class);
+    lenient().when(barCount.getValue()).thenReturn(150L);
+
+    InternalAggregations samplerSubs = mock(InternalAggregations.class);
+    lenient()
+        .when(samplerSubs.get(TableStatisticCollector.CARDINALITY_PREFIX + "foo"))
+        .thenReturn(fooCard);
+    lenient()
+        .when(samplerSubs.get(TableStatisticCollector.CARDINALITY_PREFIX + "bar"))
+        .thenReturn(barCard);
+
+    InternalSampler sampler = mock(InternalSampler.class);
+    when(sampler.getAggregations()).thenReturn(samplerSubs);
+
+    Aggregations topLevel = mock(Aggregations.class);
+    lenient().when(topLevel.get(TableStatisticCollector.SAMPLER_AGG)).thenReturn(sampler);
+    lenient().when(topLevel.get(TableStatisticCollector.MIN_PREFIX + "foo")).thenReturn(fooMin);
+    lenient().when(topLevel.get(TableStatisticCollector.MAX_PREFIX + "foo")).thenReturn(fooMax);
+    lenient().when(topLevel.get(TableStatisticCollector.COUNT_PREFIX + "foo")).thenReturn(fooCount);
+    lenient().when(topLevel.get(TableStatisticCollector.MIN_PREFIX + "bar")).thenReturn(barMin);
+    lenient().when(topLevel.get(TableStatisticCollector.MAX_PREFIX + "bar")).thenReturn(barMax);
+    lenient().when(topLevel.get(TableStatisticCollector.COUNT_PREFIX + "bar")).thenReturn(barCount);
+
+    SearchResponse response = buildResponseWithTopAggs(100L, topLevel);
+
+    Map<String, OpenSearchDataType> fieldTypes = new LinkedHashMap<>();
+    fieldTypes.put("foo", OpenSearchDataType.of(MappingType.Long));
+    fieldTypes.put("bar", OpenSearchDataType.of(MappingType.Long));
+
+    TableStatistic stat = collector.parseSearchResponse(response, fieldTypes);
+
+    assertEquals(0.2, stat.getFieldStatistic("foo").nullRatio(), 1e-9);
+    assertEquals(0.0, stat.getFieldStatistic("bar").nullRatio(), 1e-9);
   }
 
   @Test
