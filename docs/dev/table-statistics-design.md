@@ -473,3 +473,30 @@ Numeric fields in OpenSearch are indexed via `PointValues` only, with no inverte
 **Short-term mitigations available to users:** (a) run `/analyze` serially; (b) pre-create the stat system index manually so the lazy-create branch is skipped; (c) rely on the cron refresh, which serializes through the semaphore.
 
 **Proper fix (future):** In `TableStatisticStorage.put(...)`, include the GENERATING marker write as a sequence-numbered prerequisite (e.g., write COMPLETED with `if_seq_no=<GENERATING's seq>`), or replace the two-step marker with a single versioned write that encodes both start and end. Deferred — not a P0 given the cron path is the productionized consumer.
+
+### BUG-002: `RareTopPushdownRule` doesn't match the physical plan shape PPL `top N` actually produces
+
+**Reproduction:** `source=demo-events | top 2 status`, stats ON, check physical plan.
+
+**Expected:** `RareTopPushdownRule` folds the `Filter(row_number ≤ N) → Project(window) → Scan(agg-pushed)` triple into a single `RARE_TOP` pushdown entry on the scan. `AbstractCalciteIndexScan.estimateRareTopRowCount` then runs and emits `min(N, rowCount)` (no `by` columns) or `min(N × NDV, rowCount)` (with by).
+
+**Observed:** The rule never fires. Physical plan:
+```
+EnumerableLimit: rowcount = 100
+  EnumerableCalc ($condition=[row_number ≤ 2]): rowcount = 100
+    EnumerableWindow (row_number): rowcount = 200
+      CalciteEnumerableIndexScan (AGGREGATION pushed): rowcount = 200
+```
+The `LogicalFilter(row_number ≤ 2)` has already been folded into `EnumerableCalc` by the time this rule would match, and the pattern `LogicalFilter → LogicalProject → CalciteLogicalIndexScan` no longer exists in the physical plan. `estimateRareTopRowCount` is therefore never called.
+
+**Secondary symptom:** logical plan shows `LogicalFilter(row_number ≤ 2): rowcount = 1.5`, from `aggregate_rowcount=3 × default_selectivity=0.5` — no stat-backed selectivity for the `row_number ≤ N` predicate because window-function predicates aren't among the cases `TableStatisticSelectivityHandler` handles. The final `100` in physical plan comes from `EnumerableCalc`'s own guess.
+
+**Root cause analysis:** `RareTopPushdownRule.Config.DEFAULT` runs in the logical phase, expecting `Filter → Project(window) → IndexScan(agg)`. But the aggregate pushdown happens in the same optimization cycle and by the time the rule gets a chance to match, the scan already has the aggregate pushed, which inserts an intermediate state that makes the rule miss — or the rule simply never gets to fire because `LogicalFilter` is already an `EnumerableCalc` in the RelSubset.
+
+**Unit test gap:** `CalciteIndexScanCostTest` covers `estimateRareTopRowCount` directly by constructing a scan with a `RARE_TOP` pushdown already in place. This proves the formula is right, but does NOT prove the formula is reachable from a real PPL query.
+
+**Proper fix (future):** Either (a) restructure `RareTopPushdownRule` to match a `RelNode`-phase-agnostic pattern that handles `EnumerableCalc` as well, or (b) move the RARE_TOP metadata to a `Selectivity.Handler` case for `row_number ≤ literal` predicates, so the stat lookup happens in the logical plan regardless of pushdown.
+
+**Live impact:** `top N` queries get suboptimal plans because the optimizer thinks they output more rows than they actually will. Downstream physical choices (sort, merge) are over-provisioned. Not a correctness bug — results are correct — just estimate quality.
+
+**Recorded:** 2026-04-24 during demo verification.
