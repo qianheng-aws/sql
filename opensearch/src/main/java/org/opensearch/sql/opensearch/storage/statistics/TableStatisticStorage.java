@@ -56,6 +56,8 @@ public class TableStatisticStorage {
               Map.of("type", "keyword"),
               "last_updated_time",
               Map.of("type", "date", "format", "strict_date_time||epoch_millis"),
+              "index_name",
+              Map.of("type", "keyword"),
               "doc_count",
               Map.of("type", "long"),
               "fields",
@@ -166,10 +168,10 @@ public class TableStatisticStorage {
    * so the collector can decide whether to retry or mark the record {@code FAILED}.
    */
   public void put(String indexName, TableStatistic stat, ActionListener<Void> listener) {
+    Map<String, Object> source = new LinkedHashMap<>(stat.toStoredDocSource());
+    source.put("index_name", indexName);
     ensureIndexExists(
-        ActionListener.wrap(
-            ignored -> writeDoc(indexName, stat.toStoredDocSource(), listener),
-            listener::onFailure));
+        ActionListener.wrap(ignored -> writeDoc(indexName, source, listener), listener::onFailure));
   }
 
   /**
@@ -181,6 +183,7 @@ public class TableStatisticStorage {
     Map<String, Object> source = new LinkedHashMap<>();
     source.put("status", status);
     source.put("last_updated_time", Instant.now().toString());
+    source.put("index_name", indexName);
     ensureIndexExists(
         ActionListener.wrap(ignored -> writeDoc(indexName, source, listener), listener::onFailure));
   }

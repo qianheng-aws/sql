@@ -258,6 +258,43 @@ class TableStatisticStorageTest {
   }
 
   @Test
+  void put_writesIndexNameField() {
+    // The stored doc must carry an `index_name` keyword field so downstream sweeps (listStale)
+    // can return plain index names without reversing the sha256 doc id.
+    wireAdminChain();
+    mockIndexExistsTrue();
+    mockIndexSuccess();
+
+    TableStatistic stat = TableStatistic.fromFields(42L, Map.of());
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Void> listener = mock(ActionListener.class);
+    storage.put("logs-2026", stat, listener);
+
+    ArgumentCaptor<IndexRequest> captor = ArgumentCaptor.forClass(IndexRequest.class);
+    verify(nodeClient).index(captor.capture(), any());
+    assertEquals("logs-2026", captor.getValue().sourceAsMap().get("index_name"));
+
+    verify(listener).onResponse(null);
+    verify(listener, never()).onFailure(any());
+  }
+
+  @Test
+  void putStatus_writesIndexNameField() {
+    wireAdminChain();
+    mockIndexExistsTrue();
+    mockIndexSuccess();
+
+    @SuppressWarnings("unchecked")
+    ActionListener<Void> listener = mock(ActionListener.class);
+    storage.putStatus("logs-2026", TableStatistic.STATUS_GENERATING, listener);
+
+    ArgumentCaptor<IndexRequest> captor = ArgumentCaptor.forClass(IndexRequest.class);
+    verify(nodeClient).index(captor.capture(), any());
+    assertEquals("logs-2026", captor.getValue().sourceAsMap().get("index_name"));
+  }
+
+  @Test
   void put_indexRequestFailure_propagates() {
     wireAdminChain();
     mockIndexExistsTrue();
@@ -294,10 +331,11 @@ class TableStatisticStorageTest {
     assertEquals(TableStatisticStorage.docId("idx"), req.id());
 
     Map<String, Object> source = req.sourceAsMap();
-    // Minimal doc: only status + last_updated_time; no doc_count, no fields.
-    assertEquals(2, source.size(), "putStatus should write exactly two keys, got: " + source);
+    // Minimal doc: status + last_updated_time + index_name; no doc_count, no fields.
+    assertEquals(3, source.size(), "putStatus should write exactly three keys, got: " + source);
     assertEquals("GENERATING", source.get("status"));
     assertNotNull(source.get("last_updated_time"));
+    assertEquals("idx", source.get("index_name"));
     assertFalse(source.containsKey("doc_count"));
     assertFalse(source.containsKey("fields"));
 
