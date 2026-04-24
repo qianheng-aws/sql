@@ -60,6 +60,8 @@ import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
 import org.opensearch.sql.opensearch.storage.scan.context.RareTopDigest;
 import org.opensearch.sql.opensearch.storage.statistics.FieldStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticDistinctRowCountHandler;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticSelectivityHandler;
 
 @ExtendWith(MockitoExtension.class)
 public class CalciteIndexScanCostTest {
@@ -608,6 +610,67 @@ public class CalciteIndexScanCostTest {
 
     // heuristic: 3 * 1000 * (1 - 0.5) = 1500
     assertEquals(1500.0, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_filter_pushdown_uses_stat_aware_selectivity_when_handler_available() {
+    // With a TableStatistic wired and a Selectivity.Handler exposed via unwrap, the FILTER
+    // branch of estimateRowCount must route through the handler (`1/cardinality`) instead of
+    // RelMdUtil.guessSelectivity (default EQUALS = 0.15).
+    // Input field at index 0 is "dummy" (see MockFieldList). Store the stat under that name so
+    // the handler resolves the InputRef -> column properly.
+    FieldStatistic dummyStat = new FieldStatistic("keyword", 5L, null, null, List.of(), 0.0);
+    TableStatistic stat = TableStatistic.fromFields(2000L, Map.of("dummy", dummyStat));
+    when(osIndex.getStatistic()).thenReturn(stat);
+    when(table.unwrap(org.apache.calcite.rel.metadata.BuiltInMetadata.Selectivity.Handler.class))
+        .thenReturn(new TableStatisticSelectivityHandler(stat));
+
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(10));
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    RexNode cond =
+        builder.makeCall(
+            SqlStdOperatorTable.EQUALS, builder.makeInputRef(scan, 0), builder.makeLiteral("OK"));
+    FilterDigest filterDigest = new FilterDigest(0, cond);
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.FILTER, filterDigest, NO_OP_ACTION));
+
+    // 2000 × 1/5 = 400 (stat-aware), not 2000 × 0.15 = 300 (guessSelectivity)
+    assertEquals(400.0, scan.estimateRowCount(mq), 0.001);
+  }
+
+  @Test
+  void test_aggregate_pushdown_uses_distinct_row_count_handler_when_available() {
+    // Stat-backed: status.cardinality = 5, rowCount = 2000. Aggregate group-by-status should
+    // emit 5 rows (min(cardinality, rowCount)), NOT the default inputRowCount/10 = 200.
+    FieldStatistic dummyStat = new FieldStatistic("keyword", 5L, null, null, List.of(), 0.0);
+    TableStatistic stat = TableStatistic.fromFields(2000L, Map.of("dummy", dummyStat));
+    when(osIndex.getStatistic()).thenReturn(stat);
+    when(table.unwrap(
+            org.apache.calcite.rel.metadata.BuiltInMetadata.DistinctRowCount.Handler.class))
+        .thenReturn(new TableStatisticDistinctRowCountHandler(stat));
+
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(relDataType.getFieldList()).thenReturn(new MockFieldList(10));
+    lenient().when(relDataType.getFieldCount()).thenReturn(10);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    Aggregate aggregate =
+        new LogicalAggregate(
+            cluster,
+            cluster.traitSetOf(Convention.NONE),
+            List.of(),
+            scan,
+            ImmutableBitSet.of(0),
+            null,
+            List.of());
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.AGGREGATION, aggregate, NO_OP_ACTION));
+
+    assertEquals(5.0, scan.estimateRowCount(mq), 0.001);
   }
 
   @Test

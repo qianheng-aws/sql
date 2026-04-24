@@ -36,12 +36,14 @@ import org.apache.calcite.rel.core.TableScan;
 import org.apache.calcite.rel.externalize.RelWriterImpl;
 import org.apache.calcite.rel.hint.RelHint;
 import org.apache.calcite.rel.logical.LogicalAggregate;
+import org.apache.calcite.rel.metadata.BuiltInMetadata;
 import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.schema.Statistic;
+import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.NumberUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -134,6 +136,59 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
+   * Estimate the rowcount of a pushed-down aggregate.
+   *
+   * <p>The digest is an {@link Aggregate} captured at pushdown time. We would normally delegate to
+   * {@code mq.getRowCount(aggregate)}, but during physical planning {@code aggregate.getInput()}
+   * can be a {@code RelSubset} rather than a {@code TableScan}, and Calcite's {@link
+   * RelMdRowCount#getRowCount(Aggregate, RelMetadataQuery)} then bails to {@code inputRowCount /
+   * 10} because {@code mq.getDistinctRowCount} can't route to our handler through a subset.
+   *
+   * <p>Fix: consult the {@link BuiltInMetadata.DistinctRowCount.Handler} directly on *this* scan.
+   * {@code this} is the real table scan the aggregate reads from. If the handler has no stat-backed
+   * answer (no stats, empty grouping set, missing field stats), fall back to {@code
+   * mq.getRowCount(aggregate)} — which usually returns the same {@code inputRowCount / 10} default
+   * but honours any mock / override in tests.
+   */
+  private double aggregationRowCount(
+      PushDownOperation operation, RelMetadataQuery mq, double inputRowCount) {
+    RelNode digest = (RelNode) operation.digest();
+    if (digest instanceof Aggregate aggregate) {
+      ImmutableBitSet groupKey = aggregate.getGroupSet();
+      if (groupKey.isEmpty()) {
+        return 1.0;
+      }
+      BuiltInMetadata.DistinctRowCount.Handler handler =
+          getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
+      if (handler != null) {
+        Double distinct = handler.getDistinctRowCount(this, mq, groupKey, null);
+        if (distinct != null) {
+          return distinct * aggregate.getGroupSets().size();
+        }
+      }
+    }
+    return mq.getRowCount(digest);
+  }
+
+  /**
+   * Look up the selectivity of {@code predicate} via the stat-backed {@link
+   * BuiltInMetadata.Selectivity.Handler} supplied by {@link OpenSearchIndex#unwrap}; fall back to
+   * {@link RelMdUtil#guessSelectivity} when no handler is wired (stats disabled / unavailable) or
+   * the handler returns {@code null}.
+   */
+  private double selectivityFromHandlerOrGuess(RexNode predicate, RelMetadataQuery mq) {
+    BuiltInMetadata.Selectivity.Handler handler =
+        getTable().unwrap(BuiltInMetadata.Selectivity.Handler.class);
+    if (handler != null) {
+      Double selectivity = handler.getSelectivity(this, mq, predicate);
+      if (selectivity != null) {
+        return selectivity;
+      }
+    }
+    return RelMdUtil.guessSelectivity(predicate);
+  }
+
+  /**
    * Estimate the rowcount after a {@code rare}/{@code top N x by y...} pushdown.
    *
    * <p>Stat-aware path: when a {@link TableStatistic} is present and every {@code by} column has a
@@ -184,16 +239,20 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
             getBaselineRowCount(),
             (rowCount, operation) ->
                 switch (operation.type()) {
-                  case AGGREGATION -> mq.getRowCount((RelNode) operation.digest());
+                  case AGGREGATION -> aggregationRowCount(operation, mq, rowCount);
                   case PROJECT, SORT, SORT_EXPR, HIGHLIGHT -> rowCount;
                   case SORT_AGG_METRICS ->
                       NumberUtil.min(rowCount, osIndex.getQueryBucketSize().doubleValue());
-                  // Refer the org.apache.calcite.rel.metadata.RelMdRowCount
+                  // Mirror org.apache.calcite.rel.metadata.RelMdRowCount.getRowCount(Filter):
+                  // first try unwrap(Selectivity.Handler) for stat-backed estimates, then fall
+                  // back to guessSelectivity. Without this lookup, every pushed-down filter
+                  // would silently use Calcite's default (EQUALS=0.15, etc.) even when we have
+                  // per-field cardinality / null-ratio / min-max stored — wasting the stats.
                   case FILTER, SCRIPT ->
                       NumberUtil.multiply(
                           rowCount,
-                          RelMdUtil.guessSelectivity(
-                              ((FilterDigest) operation.digest()).condition()));
+                          selectivityFromHandlerOrGuess(
+                              ((FilterDigest) operation.digest()).condition(), mq));
                   case LIMIT -> Math.min(rowCount, ((LimitDigest) operation.digest()).limit());
                   case RARE_TOP -> {
                     /** similar to {@link Aggregate#estimateRowCount(RelMetadataQuery)} */
@@ -224,7 +283,7 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
     for (PushDownOperation operation : pushDownContext) {
       switch (operation.type()) {
         case AGGREGATION -> {
-          dRows = mq.getRowCount((RelNode) operation.digest());
+          dRows = aggregationRowCount(operation, mq, dRows);
           dCpu += dRows * getAggMultiplier(operation, pushDownContext);
         }
         // Ignored Project and Highlight in cost accumulation, but they affect the external cost
@@ -242,14 +301,20 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
           dCpu += NumberUtil.multiply(dRows, 1.1 * complexExprCount);
         }
         // Ignore cost the primitive filter but it will affect the rows count.
+        // Use stat-aware selectivity via Selectivity.Handler when available (same reasoning as
+        // the FILTER branch in estimateRowCount — otherwise cost uses Calcite's defaults even
+        // when we have per-field stats).
         case FILTER ->
             dRows =
                 NumberUtil.multiply(
                     dRows,
-                    RelMdUtil.guessSelectivity(((FilterDigest) operation.digest()).condition()));
+                    selectivityFromHandlerOrGuess(
+                        ((FilterDigest) operation.digest()).condition(), mq));
         case SCRIPT -> {
           FilterDigest filterDigest = (FilterDigest) operation.digest();
-          dRows = NumberUtil.multiply(dRows, RelMdUtil.guessSelectivity(filterDigest.condition()));
+          dRows =
+              NumberUtil.multiply(
+                  dRows, selectivityFromHandlerOrGuess(filterDigest.condition(), mq));
           // Calculate the cost of script filter by multiplying the selectivity of the filter and
           // the factor amplified by script count.
           dCpu += NumberUtil.multiply(dRows, Math.pow(1.1, filterDigest.scriptCount()));
