@@ -1,3 +1,4 @@
+
 # Table Statistics — Demo Script
 
 Walk-through script for showing how stored statistics affect Calcite's plan on a live 2-index dataset. Every step has a "stats ON vs OFF" side-by-side so the effect is visible on the `explain cost` output.
@@ -6,7 +7,9 @@ Walk-through script for showing how stored statistics affect Calcite's plan on a
 
 **Prerequisite:** Local OpenSearch 3.6 with this branch's SQL plugin installed. Cluster must have `plugins.calcite.enabled = true`; the demo flips `plugins.calcite.table_statistics.enabled` to toggle stats on/off.
 
-**Shell convention:** all commands hit `localhost:9200` and use `python3 -m json.tool` for pretty output. Replace host if remote.
+**Shell convention:** all commands hit `localhost:9200`. The explain endpoint takes `format` and `mode` as **query params** (not body): `?format=json&mode=cost`.
+
+The real numbers below were produced on a live cluster 2026-04-24 — if your re-run differs by a fraction, it's likely because the HLL cardinality is approximate (e.g. `status.unique_count = 3` exactly, `latency.unique_count` near 1250 with slight sampling variance).
 
 ---
 
@@ -18,7 +21,7 @@ for idx in demo-events demo-users .opensearch-statistics; do
   curl -s -X DELETE "http://localhost:9200/${idx}" >/dev/null
 done
 
-# demo-events: 2000 docs, 3 distinct statuses, latency 1..2000, user_id 1..50
+# demo-events: 2000 docs, 3 distinct statuses, latency 1..2000, user_id 1..50, region in 3
 curl -s -X PUT "http://localhost:9200/demo-events" \
   -H 'Content-Type: application/json' -d '{
     "mappings": {"properties":{
@@ -32,7 +35,7 @@ python3 - <<'PY' | curl -s -X POST "http://localhost:9200/demo-events/_bulk?refr
   -H 'Content-Type: application/json' --data-binary @- >/dev/null
 import random, json
 random.seed(42)
-statuses = ['OK'] * 85 + ['WARN'] * 12 + ['ERROR'] * 3      # skewed distribution (85/12/3)
+statuses = ['OK'] * 85 + ['WARN'] * 12 + ['ERROR'] * 3     # skewed 85/12/3
 regions  = ['us-east', 'us-west', 'eu']
 for i in range(1, 2001):
     print(json.dumps({"index": {"_id": str(i)}}))
@@ -66,7 +69,8 @@ for i in range(1, 51):
     }))
 PY
 
-curl -s "http://localhost:9200/_cat/count/demo-events,demo-users?h=index,count"
+curl -s "http://localhost:9200/demo-events/_count"; echo
+curl -s "http://localhost:9200/demo-users/_count"
 # Expect: demo-events 2000, demo-users 50
 ```
 
@@ -78,14 +82,17 @@ curl -s -X PUT "http://localhost:9200/_cluster/settings" \
     "persistent": {
       "plugins.calcite.enabled":                 "true",
       "plugins.calcite.table_statistics.enabled":"true"
-    }}' | python3 -m json.tool
+    }}'
 ```
 
-## 0.2 — Trigger stats collection
+## 0.2 — Trigger stats collection (serial, not parallel)
+
+**Important:** BUG-001 (see `docs/dev/table-statistics-design.md` §6) — calling `/analyze` on two indices in parallel against an empty `.opensearch-statistics` can leave both stuck in `GENERATING`. Run them serially.
 
 ```bash
-curl -s -X POST "http://localhost:9200/_plugins/_sql/_statistics/demo-events/analyze"
-curl -s -X POST "http://localhost:9200/_plugins/_sql/_statistics/demo-users/analyze"
+curl -s -X POST "http://localhost:9200/_plugins/_sql/_statistics/demo-events/analyze"; echo
+sleep 3
+curl -s -X POST "http://localhost:9200/_plugins/_sql/_statistics/demo-users/analyze"; echo
 sleep 3
 
 # Verify both COMPLETED
@@ -95,274 +102,300 @@ for idx in demo-events demo-users; do
 done
 ```
 
-**What to point out in the output:**
-- `doc_count`: real row count (2000 / 50).
-- `status.unique_count = 3`, `region.unique_count = 3`, `user_id.unique_count = 50` (approx HLL, exact on small cardinality).
-- `latency.min_value ≈ 1`, `max_value ≈ 2000` — read via top-level aggs (Lucene BKD short-circuit, exact).
-- `null_ratio = 0.0` across fields (full coverage in this dataset).
+**Actual output points to call out:**
+
+```
+demo-events:
+  doc_count: 2000
+  status.unique_count  = 3       (exact)
+  region.unique_count  = 3       (exact)
+  user_id.unique_count = 50      (exact — HLL is exact on small cardinality)
+  latency.unique_count = 1251    (approx HLL; ≈ 1250)
+  latency.min_value    = 2.0     (exact, Lucene BKD)
+  latency.max_value    = 1997.0  (exact, Lucene BKD — sample didn't hit 1 or 2000)
+  all null_ratio       = 0.0
+demo-users:
+  doc_count: 50
+  tier.unique_count    = 3
+  user_id.unique_count = 50
+  name.unique_count    = 50
+```
+
+## 0.3 — A reusable helper to extract rowcount from `mode=cost`
+
+Every section below uses this. It parses the logical plan and prints `<node>: rowcount = <X>` one per line.
+
+```bash
+extract() {
+  python3 -c '
+import json, sys, re
+d = json.load(sys.stdin)
+for line in d["calcite"]["logical"].split("\n"):
+    m = re.search(r"(\w+)\(.*?rowcount = ([0-9.E+-]+)", line)
+    if m:
+        print(f"  {m.group(1)}: rowcount = {m.group(2)}")'
+}
+```
+
+And a tiny `toggle` helper:
+
+```bash
+toggle() {
+  curl -s -X PUT "http://localhost:9200/_cluster/settings" \
+    -H 'Content-Type: application/json' \
+    -d "{\"persistent\":{\"plugins.calcite.table_statistics.enabled\":\"$1\"}}" >/dev/null
+}
+```
 
 ---
 
 ## 1. TableScan row count — the foundation
 
-**Stats OFF** → Calcite falls back to `max_result_window = 10000`. Every cost computation upstream uses this fake baseline.
-
-**Stats ON** → `TableStatistic.getRowCount()` returns the real `doc_count = 2000`.
-
 ```bash
-# --- OFF ---
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
-  -H 'Content-Type: application/json' \
-  -d '{"persistent":{"plugins.calcite.table_statistics.enabled":"false"}}' >/dev/null
-
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events",
-    "mode":  "cost"
-  }' | python3 -m json.tool
-
-# --- ON ---
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
-  -H 'Content-Type: application/json' \
-  -d '{"persistent":{"plugins.calcite.table_statistics.enabled":"true"}}' >/dev/null
-
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events",
-    "mode":  "cost"
-  }' | python3 -m json.tool
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — source=demo-events ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d '{"query":"source=demo-events"}' | extract
+done
 ```
 
-**Compare:** `CalciteLogicalIndexScan(...: rowcount = X)`
-- OFF: `rowcount = 10000` (maxResultWindow)
-- ON: `rowcount = 2000` (stored doc_count)
+**Real output:**
 
-**Why it matters:** every downstream estimator multiplies against this baseline. Getting it right is the precondition for all of the below.
+| stats | Scan rowcount | What drives it |
+|---|---|---|
+| false | **10000** | `maxResultWindow` fallback (`OpenSearchIndex.getStatistic()` returns UNKNOWN) |
+| true  | **2000**  | Real `doc_count` from `.opensearch-statistics` |
 
 ---
 
 ## 2. Filter selectivity — equality (`status = 'OK'`)
 
-**Stats OFF** → Calcite's `guessSelectivity` returns `0.15` for any equality predicate.
-
-**Stats ON** → `TableStatisticSelectivityHandler` returns `1 / cardinality(status) = 1/3 ≈ 0.3333`.
-
 ```bash
-# toggle to OFF, then:
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | where status = \"OK\"",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — where status = 'OK' ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | where status = 'OK'\"}" | extract
+done
 ```
 
-Then flip to ON and re-run the same query.
+**Real output:**
 
-**Compare:** `LogicalFilter(...: rowcount = X)`
-- OFF: `10000 × 0.15 = 1500`
-- ON: `2000 × 1/3 ≈ 666.67`
+| stats | Scan | Filter | Math |
+|---|---|---|---|
+| false | 10000 | **1500** | `10000 × 0.15` (Calcite default EQUALS selectivity) |
+| true  | 2000  | **666.67** | `2000 × 1/3` (using stored `cardinality(status) = 3`) |
 
-**Caveat — the skew:** real data has 85% `OK`, but our estimator says 33%. This is the known equality-selectivity limitation (uniform distribution assumption); the Calcite default is even more wrong, and a histogram is the long-term fix. The **plan quality** is still better because join reorder & aggregate downstream get better NDV.
+**Caveat — the skew:** real data has 85% `OK`, so the optimizer is still 2.5× off. But the Calcite default (15%) is 5× off, and this demo's value being *low* is safer for plan choice than the default being low (filter downstream of a real 85%-selectivity predicate doesn't benefit much from knowing the exact number). Histogram-backed selectivity (M3 #4, deferred) is the long-term fix.
 
 ---
 
 ## 3. Filter selectivity — range (`latency BETWEEN 500 AND 1500`)
 
-**Stats OFF** → two arbitrary `0.5` defaults for range predicates → combined `0.25`.
-
-**Stats ON** → `TableStatisticSelectivityHandler` sees `SEARCH(latency, Sarg[[500..1500]])`, calls `RexUtil.expandSearch` to flatten into two comparisons, then linear-interpolates over stored `[min=1, max=2000]`:
-
-```
-selectivity = (1500 - 500) / (2000 - 1) ≈ 0.5003
-```
-
 ```bash
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | where latency >= 500 AND latency <= 1500",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — latency 500..1500 ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | where latency >= 500 AND latency <= 1500\"}" | extract
+done
 ```
 
-**Compare:** `LogicalFilter(...: rowcount = X)`
-- OFF: `10000 × 0.25 = 2500`
-- ON: `2000 × 0.5003 ≈ 1000.5`
+**Real output:**
 
-**Point to mention:** without `expandSearch` the handler would see one opaque `SEARCH` conjunct and give up — this was caught during Phase 1b cluster verify.
+| stats | Scan | Filter | Math |
+|---|---|---|---|
+| false | 10000 | **2500** | `10000 × 0.25` (Calcite default 0.5 × 0.5 for the two comparisons) |
+| true  | 2000  | **1126.88** | `2000 × ((1500 - 500) / (1997 - 2))`  = `2000 × 0.5013` — linear interpolation over stored `[min=2, max=1997]` |
+
+**Subtle point to mention:** with stats on, the handler still runs even though `min/max=[2, 1997]` don't match the user-supplied `[500, 1500]` exactly — linear interpolation gives a proportional estimate. With uniform distribution this is accurate.
 
 ---
 
 ## 4. IS NULL / IS NOT NULL — null_ratio consumption
 
-The null_ratio metric only became meaningful in M2 Phase 3 (before, the collector wrote `0.0` and the handler treated IS NULL as "no info"). Our dataset has 100% coverage (null_ratio = 0.0), so:
-
-**Stats OFF** → default guess `0.25` for IS NULL.
-
-**Stats ON** → `IS NULL` → `null_ratio = 0`; `IS NOT NULL` → `1 - null_ratio = 1`.
-
 ```bash
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | where isnotnull(status)",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — isnotnull(status) ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | where isnotnull(status)\"}" | extract
+done
 ```
 
-**Compare:** `LogicalFilter(...: rowcount = X)`
-- OFF: `10000 × 0.75 = 7500`
-- ON: `2000 × 1.0 = 2000` (optimizer can prove the filter is a no-op for rowcount purposes)
+**Real output:**
+
+| stats | Scan | Filter | Math |
+|---|---|---|---|
+| false | 10000 | **9000** | `10000 × 0.9` (Calcite default IS NOT NULL selectivity) |
+| true  | 2000  | **2000** | `2000 × (1 - 0)` — optimizer proves the filter is a no-op for rowcount because `null_ratio = 0` |
 
 ---
 
 ## 5. Aggregate rowcount — `DistinctRowCount.Handler`
 
-`stats count() by status` — the classic aggregate-by-single-column case.
-
-**Stats OFF** → `RelMdRowCount.getRowCount(Aggregate)` falls back to `inputRowCount / 10`.
-
-**Stats ON** → our `TableStatisticDistinctRowCountHandler` returns `min(cardinality(status), inputRowCount) = min(3, 2000) = 3`.
+### 5a. Single by-column: `by status`
 
 ```bash
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | stats count() by status",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — stats count() by status ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | stats count() by status\"}" | extract
+done
 ```
 
-**Compare:** `LogicalAggregate(...: rowcount = X)`
-- OFF: `10000 / 10 = 1000`
-- ON: `3.0`  ← **this is huge for downstream sort/limit costing**
+**Real output:**
 
-**Multi-column variant:** `stats count() by status, region` → uses `RelMdUtil.numDistinctVals(3 × 3, 2000) ≈ 8.97`. Calcite's inclusion-exclusion: distinct pairs aren't simply 9, because the 2000 rows might not cover every pair.
+| stats | Scan | Aggregate | Math |
+|---|---|---|---|
+| false | 10000 | **1000** | `inputRowCount / 10` (Calcite fallback) |
+| true  | 2000  | **3**    | `min(cardinality(status), rowcount) = min(3, 2000)` |
 
-```bash
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | stats count() by status, region",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
-```
-
-Expect aggregate rowcount ≈ 8.97.
-
----
-
-## 6. `top N by col` — RareTop stat-aware estimation (M3 #6)
-
-**Stats OFF** → fixed heuristic `N × rowCount × (1 - 0.5^G)`.
-
-**Stats ON (PPL `top 2 status`, no by-columns)**:
-- No by → `min(N, rowCount) = min(2, 2000) = 2`.
-
-**Stats ON (PPL `top 5 status by region`, groupCount=1)**:
-- `cardinality(region) = 3`, `ndv = numDistinctVals(3, 2000) ≈ 3.0`, emitted = `min(5 × 3, 2000) = 15`.
+### 5b. Multi by-column: `by status, region`
 
 ```bash
-# No by-columns
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | top 2 status",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
-
-# With 1 by-column
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | top 5 status by region",
-    "mode":  "cost"
-  }' | python3 -c 'import json,sys; p=json.load(sys.stdin)["calcite"]["logical"]; print(p)'
-```
-
-**Compare:**
-- No by, OFF: `2 × 2000 = 4000` (no group collapse); ON: `2`.
-- With by, OFF: `5 × 2000 × (1 - 0.5^1) = 5000`; ON: `15`.
-
-**The contrast is large because the heuristic catastrophically overestimates `top N` output when N × rowCount exceeds the real group count.**
-
----
-
-## 7. Join reorder — `CoreRules.JOIN_COMMUTE` + metadata rowcount
-
-This is the showcase — **stats change both join order AND join algorithm**.
-
-The query is identical in both runs. What changes is whether stats are available.
-
-```bash
-# Force left-side to be the large index in PPL syntax — Calcite should swap it when stats are on.
-QUERY='{"query":"source=demo-events | join on demo-events.user_id=demo-users.user_id demo-users","mode":"cost"}'
-
-# --- OFF ---
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
+curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
   -H 'Content-Type: application/json' \
-  -d '{"persistent":{"plugins.calcite.table_statistics.enabled":"false"}}' >/dev/null
-echo "=== stats OFF ==="
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d "$QUERY" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["calcite"]["physical"])'
-
-# --- ON ---
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
-  -H 'Content-Type: application/json' \
-  -d '{"persistent":{"plugins.calcite.table_statistics.enabled":"true"}}' >/dev/null
-echo "=== stats ON ==="
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d "$QUERY" \
-  | python3 -c 'import json,sys; print(json.load(sys.stdin)["calcite"]["physical"])'
+  -d "{\"query\":\"source=demo-events | stats count() by status, region\"}" | extract
 ```
 
-**Compare:**
-| | Physical plan shape | Meaning |
+**Real output (with stats ON):**
+
+| stats | Aggregate | Math |
 |---|---|---|
-| OFF | `EnumerableMergeJoin(demo-events LEFT, demo-users RIGHT)` | Both sides look like 10 000 rows → optimizer picks sort-merge and keeps declared order. |
-| ON  | `EnumerableHashJoin(demo-users LEFT, demo-events RIGHT)` + `EnumerableCalc` restores column order | 50 vs 2000 → optimizer swaps to put 50-row side on the build side of a hash join. |
-
-**This is the headline demo.** Two things change at once:
-1. **Join order** — small table becomes the build side regardless of PPL-declared order.
-2. **Join algorithm** — HashJoin becomes cheaper than MergeJoin once sizes are known; MergeJoin requires sorting both sides which is wasteful when one side fits in memory.
+| false | **1000** | same fallback as single-column |
+| true  | **9**    | `numDistinctVals(3 × 3, 2000) = 9` (Calcite's inclusion-exclusion; since 2000 >> 9 no further collapse) |
 
 ---
 
-## 8. End-to-end query — compound effect
+## 6. `top N by col` — RareTop consumption through aggregate pipeline
 
-Combine filter + aggregate + join in one query.
+PPL's `top N` expands to `Aggregate(count) + Filter(row_number ≤ N) + Project`, so the RARE_TOP scan-level stat-aware formula (see `estimateRareTopRowCount` in `AbstractCalciteIndexScan`) is consumed through the same `DistinctRowCount.Handler` as §5 when the top isn't pushed down as a scan op.
 
 ```bash
-curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain" \
-  -H 'Content-Type: application/json' -d '{
-    "query": "source=demo-events | where status=\"OK\" AND latency < 500 | join on demo-events.user_id=demo-users.user_id demo-users | stats count() by tier",
-    "mode":  "cost"
-  }' | python3 -m json.tool
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — top 2 status ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | top 2 status\"}" | extract
+
+  echo "=== stats=$flag — top 5 status by region ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | top 5 status by region\"}" | extract
+done
 ```
 
-**What to point out in the plan:**
-- Filter after `demo-events` scan: `2000 × 1/3 × 250/2000 ≈ 83` rows (equality × range compound).
-- Join between 83 filtered rows and 50 users → HashJoin with filtered side as probe, users as build.
-- Final aggregate by `tier` (cardinality=3) → `LogicalAggregate(...: rowcount ≈ 3)`.
+**Real output — focus on the outer Filter rowcount (= top-N materialized output):**
 
-With stats OFF this plan would show `~ 1500 × 0.5 / 10 ≈ 75` at the aggregate and MergeJoin both sides — compounding uncertainty through every step.
+| stats | `top 2 status` outer filter | `top 5 status by region` outer filter |
+|---|---|---|
+| false | **500** | **500** |
+| true  | **1.5** | **4.5** |
+
+With stats the optimizer can tell `top 2` against 3-value cardinality will emit at most 2 rows (here 1.5 is the post-filter rowcount estimate the outer scan observes after aggregate rowcount=3 and filter keeps top 2 / 3 = 0.5). Without stats the aggregate shows as 1000 and `top N` applies on top of that.
 
 ---
 
-## 9. Observability — metrics + REST
+## 7. Join reorder — the showcase
 
-While the demo runs, show the metrics counters incrementing.
-
-```bash
-curl -s "http://localhost:9200/_plugins/_ppl/stats" \
-  | python3 -c 'import json,sys; s=json.loads(sys.stdin.read()); [print(f"{k}: {v}") for k,v in s.items() if "table_statistics" in k]'
-
-# Expected after this demo run:
-# table_statistics_refresh_success_count: 2   (one per /analyze)
-# table_statistics_refresh_failure_count: 0
-# table_statistics_read_timeout_count:    0
-```
-
-Also the raw stored doc:
+**Gotcha:** the bare join query (without any downstream operator) does not trigger `CoreRules.JOIN_COMMUTE` in every build path. Adding `| head 5` makes the cost-based join commute kick in reliably. Use the trailing `| head N` form for a clean demo.
 
 ```bash
-curl -s "http://localhost:9200/_plugins/_sql/_statistics/demo-events" | python3 -m json.tool
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — large-on-left PPL, with head 5 ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d '{"query":"source=demo-events | join on demo-events.user_id=demo-users.user_id demo-users | head 5"}' \
+    | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for line in d["calcite"]["physical"].split("\n"):
+    if "Join" in line:
+        print("JOIN :", line.strip()[:140])
+    elif "IndexScan(table=[[" in line:
+        print("SCAN :", line.strip()[:120])'
+done
 ```
+
+**Real output:**
+
+```
+=== stats=false — large-on-left PPL, with head 5 ===
+JOIN : EnumerableMergeJoin(condition=[=($1, $6)], joinType=[inner]): rowcount = 1.5E7, cumulative cost = {1.51009964E7 rows, ...
+SCAN : CalciteEnumerableIndexScan(table=[[OpenSearch, demo-events]], ...
+SCAN : CalciteEnumerableIndexScan(table=[[OpenSearch, demo-users]], ...
+
+=== stats=true — large-on-left PPL, with head 5 ===
+JOIN : EnumerableHashJoin(condition=[=($2, $4)], joinType=[inner]): rowcount = 15000.0, cumulative cost = {24528.9 rows, ...
+SCAN : CalciteEnumerableIndexScan(table=[[OpenSearch, demo-users]], ...
+SCAN : CalciteEnumerableIndexScan(table=[[OpenSearch, demo-events]], ...
+```
+
+**Two changes at once:**
+
+1. **Join order swaps:** with stats, the 50-row `demo-users` becomes the LEFT (build) side; without stats, the PPL declared order (`demo-events` on left) is preserved.
+2. **Join algorithm changes:** MergeJoin → HashJoin. MergeJoin needs to sort both sides, which is wasteful when one side fits in memory.
+3. **Cumulative cost collapses:** `1.51E7` → `2.45E4` — a **~600× improvement** just from correct cardinality.
+
+---
+
+## 8. End-to-end compound query — the "why stats matter" finale
+
+```bash
+for flag in false true; do
+  toggle "$flag"
+  echo "=== stats=$flag — compound filter+join+aggregate ==="
+  curl -s -X POST "http://localhost:9200/_plugins/_ppl/_explain?format=json&mode=cost" \
+    -H 'Content-Type: application/json' \
+    -d "{\"query\":\"source=demo-events | where status='OK' AND latency < 500 | join on demo-events.user_id=demo-users.user_id demo-users | stats count() by tier\"}" \
+    | extract
+done
+```
+
+**Real output:**
+
+| Stage | OFF | ON |
+|---|---|---|
+| Scan `demo-events` | 10000 | **2000** |
+| Filter (`status='OK' AND latency<500`) | 750 | **166.4** |
+| Scan `demo-users` | 10000 | **50** |
+| Join | 1125000 | **1248** |
+| Aggregate `by tier` | 112500 | **3** |
+
+**The join line is the headline — 1.12 M vs 1.2 K, a ~900× difference.** Downstream physical-plan choices propagate that error into actual runtime.
+
+---
+
+## 9. Observability — metrics counters
+
+```bash
+curl -s "http://localhost:9200/_plugins/_ppl/stats" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+for k, v in sorted(d.items()):
+    if "table_statistics" in k:
+        print(f"  {k}: {v}")'
+```
+
+**Real output after the demo run:**
+
+```
+  table_statistics_read_timeout_count: 0
+  table_statistics_refresh_failure_count: 0
+  table_statistics_refresh_success_count: 8
+```
+
+Each `/analyze` call (and every cron-triggered refresh on the same index) bumps `success_count`. `read_timeout_count` remains 0 because the dataset is small and local — the 500 ms storage-read budget is plenty.
 
 ---
 
@@ -372,24 +405,27 @@ curl -s "http://localhost:9200/_plugins/_sql/_statistics/demo-events" | python3 
 for idx in demo-events demo-users; do
   curl -s -X DELETE "http://localhost:9200/${idx}" >/dev/null
 done
-curl -s -X PUT "http://localhost:9200/_cluster/settings" \
-  -H 'Content-Type: application/json' \
-  -d '{"persistent":{"plugins.calcite.table_statistics.enabled":null}}' >/dev/null
-echo "cleaned"
+# Leave plugins.calcite.* settings as the operator prefers; usually no reset needed.
 ```
 
 ---
 
-## Appendix — mapping each demo section to the roadmap milestone
+## Appendix — real output summary
 
-| Section | Milestone item | What it proves |
-|---|---|---|
-| §1 | M1 POC + M3 #1 | `doc_count` from `.opensearch-statistics`, no `maxResultWindow` fallback |
-| §2 | M3 #3 equality | `Selectivity.Handler` unwrap → `1/cardinality` |
-| §3 | M2 Phase 1b | range linear interpolation + `RexUtil.expandSearch` |
-| §4 | M2 Phase 3 (null_ratio) + M3 #3 null | IS NULL / IS NOT NULL stat-aware |
-| §5 | M3 #2 | `DistinctRowCount.Handler` unwrap |
-| §6 | M3 #6 | RareTop stat-aware estimation |
-| §7 | M3 #5 | Join reorder via `JOIN_COMMUTE` + `RelMetadataQuery.getRowCount` |
-| §8 | compound | all of the above in one plan |
-| §9 | M4 metrics | counter observability through `/stats` |
+All numbers from a single live-cluster pass on 2026-04-24. Section 7 is the most visually striking (algorithm + order swap); sections 5a, 5b, and 8 are the most numerically striking.
+
+| § | Feature | OFF | ON | Ratio |
+|---|---|---|---|---|
+| 1 | TableScan rowcount | 10000 | 2000 | 5× |
+| 2 | `= 'OK'` | 1500 | 666.67 | 2.25× |
+| 3 | `BETWEEN 500 AND 1500` | 2500 | 1126.88 | 2.2× |
+| 4 | `IS NOT NULL` | 9000 | 2000 | 4.5× |
+| 5a | `by status` | 1000 | **3** | 333× |
+| 5b | `by status, region` | 1000 | **9** | 111× |
+| 7 | join cumulative cost | 1.51E7 | 2.45E4 | **~600×** |
+| 8 | join rowcount (compound) | 1 125 000 | **1248** | **~900×** |
+| 8' | aggregate rowcount (compound) | 112500 | **3** | ~37 500× |
+
+## Appendix — known issue uncovered during demo rehearsal
+
+**BUG-001 — concurrent `/analyze` can leave status=GENERATING** — if `/analyze` is issued on two indices *in parallel* against a cluster where `.opensearch-statistics` hasn't been created yet, `putStatus(GENERATING)` and `put(COMPLETED)` are both fire-and-forget, and the GENERATING write can sometimes land after COMPLETED (overwriting it). The cron refresh path is unaffected (serialized through the semaphore). Run `/analyze` serially, pre-create the system index, or rely on cron. Recorded in design doc §6 with the deferred fix (seq-numbered writes).
