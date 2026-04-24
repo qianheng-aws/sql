@@ -69,6 +69,7 @@ import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
 import org.opensearch.sql.opensearch.storage.scan.context.RareTopDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.SortExprDigest;
+import org.opensearch.sql.opensearch.storage.statistics.FieldStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 
 /** An abstract relational operator representing a scan of an OpenSearchIndex type. */
@@ -133,6 +134,45 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
+   * Estimate the rowcount after a {@code rare}/{@code top N x by y...} pushdown.
+   *
+   * <p>Stat-aware path: when a {@link TableStatistic} is present and every {@code by} column has a
+   * stored cardinality, the group count is {@link RelMdUtil#numDistinctVals} of the cardinality
+   * product capped at the baseline rowcount, and the emitted rowcount is {@code min(N × NDV,
+   * rowCount)}. When no {@code by} columns are present, the emitted rowcount is {@code min(N,
+   * rowCount)}.
+   *
+   * <p>Fallback path: with no stats (or any {@code by} column missing stats — e.g. text without a
+   * keyword sub-field), we preserve the original heuristic {@code N × rowCount × (1 - 0.5^G)} which
+   * mimics Calcite's {@link Aggregate#estimateRowCount} group-count guess.
+   */
+  private double estimateRareTopRowCount(RareTopDigest digest, double rowCount) {
+    final int n = digest.number();
+    final List<String> byList = digest.byList();
+    final int groupCount = byList.size();
+    if (groupCount == 0) {
+      return Math.min(n, rowCount);
+    }
+    if (osIndex.getStatistic() instanceof TableStatistic tableStat) {
+      double cardinalityProduct = 1.0;
+      boolean allFieldsCovered = true;
+      for (String col : byList) {
+        FieldStatistic fieldStat = tableStat.getFieldStatistic(col);
+        if (fieldStat == null || fieldStat.cardinality() <= 0) {
+          allFieldsCovered = false;
+          break;
+        }
+        cardinalityProduct *= (double) fieldStat.cardinality();
+      }
+      if (allFieldsCovered) {
+        double ndv = RelMdUtil.numDistinctVals(cardinalityProduct, rowCount);
+        return Math.min(n * ndv, rowCount);
+      }
+    }
+    return n * rowCount * (1.0 - Math.pow(.5, groupCount));
+  }
+
+  /**
    * Compute the final row count of the scan operator with the given push down operations.
    *
    * <p>The calculation logic tries to follow the same logic in Calcite.
@@ -158,11 +198,7 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
                   case RARE_TOP -> {
                     /** similar to {@link Aggregate#estimateRowCount(RelMetadataQuery)} */
                     final RareTopDigest digest = (RareTopDigest) operation.digest();
-                    int factor = digest.number();
-                    final int groupCount = digest.byList().size();
-                    yield groupCount == 0
-                        ? factor
-                        : factor * rowCount * (1.0 - Math.pow(.5, groupCount));
+                    yield estimateRareTopRowCount(digest, rowCount);
                   }
                 },
             (a, b) -> null);

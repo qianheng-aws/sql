@@ -25,9 +25,11 @@ import org.apache.calcite.plan.RelOptPlanner;
 import org.apache.calcite.plan.RelOptTable;
 import org.apache.calcite.plan.RelTraitSet;
 import org.apache.calcite.rel.RelCollations;
+import org.apache.calcite.rel.RelFieldCollation.Direction;
 import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.logical.LogicalAggregate;
+import org.apache.calcite.rel.metadata.RelMdUtil;
 import org.apache.calcite.rel.metadata.RelMetadataQuery;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeFactory;
@@ -55,6 +57,8 @@ import org.opensearch.sql.opensearch.storage.scan.context.LimitDigest;
 import org.opensearch.sql.opensearch.storage.scan.context.OSRequestBuilderAction;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownOperation;
 import org.opensearch.sql.opensearch.storage.scan.context.PushDownType;
+import org.opensearch.sql.opensearch.storage.scan.context.RareTopDigest;
+import org.opensearch.sql.opensearch.storage.statistics.FieldStatistic;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatistic;
 
 @ExtendWith(MockitoExtension.class)
@@ -531,6 +535,79 @@ public class CalciteIndexScanCostTest {
     CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
 
     assertEquals(500_000.0, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_rareTop_rowCount_no_by_clamps_to_rowCount() {
+    // baseline 3 rows, N=100, no by-columns → min(100, 3) = 3
+    TableStatistic stat = TableStatistic.fromFields(3L, Map.of());
+    when(osIndex.getStatistic()).thenReturn(stat);
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    RareTopDigest digest = new RareTopDigest("foo", List.of(), 100, Direction.DESCENDING);
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.RARE_TOP, digest, NO_OP_ACTION));
+
+    assertEquals(3.0, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_rareTop_rowCount_single_by_uses_cardinality() {
+    // baseline 1000, N=3, by status (cardinality=5) → min(3 * 5, 1000) = 15
+    FieldStatistic statusStat = new FieldStatistic("keyword", 5L, null, null, List.of(), 0.0);
+    TableStatistic stat = TableStatistic.fromFields(1000L, Map.of("status", statusStat));
+    when(osIndex.getStatistic()).thenReturn(stat);
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    RareTopDigest digest = new RareTopDigest("latency", List.of("status"), 3, Direction.DESCENDING);
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.RARE_TOP, digest, NO_OP_ACTION));
+
+    assertEquals(15.0, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_rareTop_rowCount_multi_by_uses_numDistinctVals() {
+    // baseline 1000, N=2, by status(5) × region(4) = 20 raw product.
+    // numDistinctVals(20, 1000) ≈ 19.80 (Calcite's inclusion-exclusion formula),
+    // then emitted = min(2 * 19.80, 1000) ≈ 39.60.
+    FieldStatistic statusStat = new FieldStatistic("keyword", 5L, null, null, List.of(), 0.0);
+    FieldStatistic regionStat = new FieldStatistic("keyword", 4L, null, null, List.of(), 0.0);
+    TableStatistic stat =
+        TableStatistic.fromFields(1000L, Map.of("status", statusStat, "region", regionStat));
+    when(osIndex.getStatistic()).thenReturn(stat);
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    RareTopDigest digest =
+        new RareTopDigest("latency", List.of("status", "region"), 2, Direction.DESCENDING);
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.RARE_TOP, digest, NO_OP_ACTION));
+
+    double expected = 2 * RelMdUtil.numDistinctVals(20.0, 1000.0);
+    assertEquals(expected, scan.estimateRowCount(mq));
+  }
+
+  @Test
+  void test_rareTop_rowCount_missing_stats_falls_back_to_heuristic() {
+    // byList has "status" but stat for it is missing → fallback to N * rowCount * (1 - 0.5^G)
+    TableStatistic stat = TableStatistic.fromFields(1000L, Map.of());
+    when(osIndex.getStatistic()).thenReturn(stat);
+    RelDataType relDataType = mock(RelDataType.class);
+    lenient().when(table.getRowType()).thenReturn(relDataType);
+    CalciteLogicalIndexScan scan = new CalciteLogicalIndexScan(cluster, table, osIndex);
+
+    RareTopDigest digest = new RareTopDigest("latency", List.of("status"), 3, Direction.DESCENDING);
+    scan.getPushDownContext()
+        .add(new PushDownOperation(PushDownType.RARE_TOP, digest, NO_OP_ACTION));
+
+    // heuristic: 3 * 1000 * (1 - 0.5) = 1500
+    assertEquals(1500.0, scan.estimateRowCount(mq));
   }
 
   @Test
