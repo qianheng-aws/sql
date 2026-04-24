@@ -545,3 +545,25 @@ case FILTER, SCRIPT -> {
 **Unit test gap:** `CalciteIndexScanCostTest.test_cost_on_filter_pushdown` hard-codes the expected result as `2000 × 0.15 = 300` — it asserts the *current* behavior, which is the buggy one. The test would need updating along with the fix.
 
 **Recorded:** 2026-04-24 during demo verification (logical vs physical divergence spotted by reviewer question).
+
+### UPDATE 2026-04-24: BUG-003 fixed; same class of issue was present in the AGGREGATION branch too
+
+`AbstractCalciteIndexScan.estimateRowCount` and `.computeSelfCost` now consult
+`Selectivity.Handler` / `DistinctRowCount.Handler` directly via `getTable().unwrap(...)` on the
+scan itself, falling back to the prior heuristic (`RelMdUtil.guessSelectivity`, `inputRowCount /
+10`) only when no handler is wired.
+
+The aggregate branch had been overlooked — we delegated to `mq.getRowCount((Aggregate)
+operation.digest())`, which in turn calls `mq.getDistinctRowCount(aggregate.getInput(), ...)`.
+During physical planning `aggregate.getInput()` is a `RelSubset`, so Calcite's routing
+skips our handler and falls back to `inputRowCount / 10`. By consulting the handler on `this`
+scan directly we bypass the subset entirely.
+
+Live verification on `demo-events`:
+- `where status = 'OK'`: logical 666.67, physical scan (filter pushed) **666.67** — matched.
+- `stats count() by status, region`: logical 9.0, physical scan (agg pushed) **9.0** — matched.
+
+New unit tests (`test_filter_pushdown_uses_stat_aware_selectivity_when_handler_available`,
+`test_aggregate_pushdown_uses_distinct_row_count_handler_when_available`) lock in the
+invariant that the handler is reachable from the scan's own rowcount logic, not only from the
+logical-plan `RelMd*` dispatch.
