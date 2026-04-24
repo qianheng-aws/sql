@@ -273,13 +273,17 @@ M2 is split into phases by ROI and implementation cost.
 
 **Known limitation:** uniform-distribution assumption is poor on skewed data (see §3.4). Histogram support is the fix; gated on multi-plan candidate generation in M3+.
 
-#### Phase 2 — Cron-driven refresh
+#### Phase 2 — Cron-driven refresh (DONE)
 
-- [ ] `ThreadPool.schedule` tick (default interval 60 s, configurable via `plugins.calcite.table_statistics.refresh_interval`).
-- [ ] Track known indices via `ClusterStateListener` or enumerate on tick.
-- [ ] Per-index TTL staleness check (reuses existing `TableStatistic.isStale(ttl)`).
-- [ ] Concurrent-refresh throttling: cap per node (default 4), backpressure-aware.
-- [ ] See §3.3 for why this is NOT a refresh-listener-based design.
+- [x] `ThreadPool.scheduleWithFixedDelay` tick driven from the cluster-manager via `LocalNodeClusterManagerListener` (interval via `plugins.calcite.table_statistics.refresh_interval`, default 60 s).
+- [x] Scan source is `.opensearch-statistics` (rejected: `ClusterState` enumeration — see §3.5).
+- [x] Per-index TTL staleness check via `storage.listStale(ttl, ...)` (TTL from `plugins.calcite.table_statistics.ttl`, default 24 h).
+- [x] Concurrent-refresh throttling via `Semaphore` (default 4, via `plugins.calcite.table_statistics.refresh_max_in_flight`).
+- [x] Search rejection (`OpenSearchRejectedExecutionException`) skipped without writing a FAILED marker.
+- [x] IT coverage: `cronSettingsAreLive` in `TableStatisticsIT` (settings-lifecycle smoke; true end-to-end validated on live cluster).
+- [ ] Follow-up (Phase 3): `listStale` pagination when stat-docs > 1000, orphan-doc cleanup.
+- See §3.3 for why this is NOT a refresh-listener-based design.
+- See §3.5 for the full decision matrix and rejected alternatives.
 
 #### Phase 3 — Collector quality-of-service
 
@@ -324,6 +328,10 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-24 — M2 Phase 2 shipped
+
+Cron refresh lands: `TableStatisticRefreshScheduler` + `TableStatisticRefreshTask` run on the elected cluster-manager, sweeping `.opensearch-statistics` every 60 s (default) and refreshing any stat whose `last_updated_time` is older than the TTL (default 24 h). Three new dynamic settings (`refresh_interval`, `ttl`, `refresh_max_in_flight`) promoted from hardcoded defaults. Notable wrinkle: the stored doc needed a new `index_name` keyword field so the sweeper's `listStale` could return names directly — old-format docs remain readable but are invisible to the sweep until their next refresh rewrites them, which is acceptable (see spec §3.3). IT `cronSettingsAreLive` proves the settings plumbing; the 5 s-interval end-to-end test I originally wrote was flaky against the shared IT cluster (GENERATING-marker dedup from neighbour tests), so real staleness→refresh is validated by unit tests plus live-cluster smoke. Unit coverage: `TableStatisticRefreshTaskTest` (4 cases), `TableStatisticRefreshSchedulerTest` (5 cases), plus collector rejection-skip path.
 
 ### 2026-04-23 — M2 Phase 2 design finalized
 
