@@ -457,3 +457,19 @@ Numeric fields in OpenSearch are indexed via `PointValues` only, with no inverte
 ---
 
 *Maintained alongside the `table-statistics` branch. Update Section 4 (Roadmap) as milestones complete, and append to Section 5 (Work log) after each substantive commit or decision.*
+
+## 6. Known bugs / follow-ups
+
+### BUG-001: Concurrent `/analyze` can leave status=GENERATING
+
+**Reproduction:** Parallel `POST /_plugins/_sql/_statistics/{index}/analyze` calls on different indices, against a cluster where `.opensearch-statistics` does not yet exist.
+
+**Symptom:** Final stored docs have `status=GENERATING` (and missing `doc_count` / `fields`) even though the collector's DEBUG log shows `Collected statistic for X` (i.e., `storage.put(COMPLETED)` *was* invoked).
+
+**Root cause:** Both `putStatus(GENERATING)` (start-of-refresh marker) and `put(COMPLETED)` (end-of-refresh) are fire-and-forget through `nodeClient.index(...)`. Under the right scheduling, the GENERATING write lands *after* the COMPLETED write, overwriting it. OpenSearch indexing requests don't preserve client-issue order across the cluster, only per-shard / per-primary.
+
+**Observed:** 2026-04-24 during manual demo verification. Parallel analyze on `demo-events` + `demo-users` (empty `.opensearch-statistics`) left both indices with `GENERATING`. A single subsequent analyze of each index completed normally — the race only hits the lazy-create path.
+
+**Short-term mitigations available to users:** (a) run `/analyze` serially; (b) pre-create the stat system index manually so the lazy-create branch is skipped; (c) rely on the cron refresh, which serializes through the semaphore.
+
+**Proper fix (future):** In `TableStatisticStorage.put(...)`, include the GENERATING marker write as a sequence-numbered prerequisite (e.g., write COMPLETED with `if_seq_no=<GENERATING's seq>`), or replace the two-step marker with a single versioned write that encodes both start and end. Deferred — not a P0 given the cron path is the productionized consumer.
