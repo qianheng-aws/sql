@@ -307,7 +307,7 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 - [x] **#3 Filter selectivity (range)** — M2 Phase 1b, linear interpolation over stored `[min, max]` + `RexUtil.expandSearch` for `BETWEEN` / Sarg.
 - [x] **#1 TableScan row count override** — `AbstractCalciteIndexScan.getBaselineRowCount()` already consumes `TableStatistic.getRowCount()` with `maxResultWindow` as the UNKNOWN fallback; all rowcount consumers (join reorder, aggregate metadata) route through `RelMetadataQuery` into this method. The roadmap's earlier "non-Calcite paths benefit" framing was an artifact — V2 has no cost-based planner to benefit, so nothing to promote.
 - [ ] **#4 Histogram-backed selectivity** — replace the uniform-distribution min/max formula with equi-height histograms (~50 buckets per numeric/date field). See §3.4. Gated on real ROI, expected to be driven by multi-plan candidate generation in JOIN scenarios.
-- [ ] **#5 Join reorder hints.** With both sides carrying stats, we can reorder joins by smaller-input-first. Requires the metadata handlers above plus verified handling of non-null join predicates.
+- [x] **#5 Join reorder** — Verified working on a live cluster (2026-04-24): on `large-events (500 docs) ⋈ small-users (3 docs)`, Calcite's `CoreRules.JOIN_COMMUTE` (from `Programs.standard()`) plus our `RelMetadataQuery.getRowCount` path produce an `EnumerableHashJoin(small-users on left, large-events on right)` regardless of the PPL-declared order. With stats disabled, the same query produces `EnumerableMergeJoin` preserving the input order. Stats drive both join-order and join-algorithm selection.
 - [x] **#6 `RareTop` / `top_n` quality** — `AbstractCalciteIndexScan.estimateRowCount`'s RARE_TOP branch now uses `min(N, rowCount)` for no-by, and `min(N × numDistinctVals(Π cardinality, rowCount), rowCount)` for one-or-more `by` columns. Falls back to the legacy heuristic when any `by` column lacks stats.
 
 ### Milestone 4 — Productionization
@@ -329,6 +329,22 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-24 — M3 #5 Join reorder verified working
+
+On `large-events (500 docs) ⋈ small-users (3 docs)`:
+
+- **Stats ON**: `EnumerableHashJoin(small-users on left, large-events on right)` — the
+  optimizer puts the small table on the left (build side), regardless of PPL-declared order.
+  An extra `EnumerableCalc` reshapes the output so column ordering is preserved.
+- **Stats OFF**: `EnumerableMergeJoin(large-events on left, small-users on right)` —
+  preserves PPL input order, picks sort-merge because both sides look like 10 000 rows.
+
+So stats-driven join reorder *and* join-algorithm selection both work today — Calcite's
+`Programs.standard()` ships `CoreRules.JOIN_COMMUTE`, and that rule consults
+`RelMetadataQuery.getRowCount(join)` which routes into our `AbstractCalciteIndexScan.
+estimateRowCount` → `TableStatistic.getRowCount()`. No wiring change needed; just having
+the metadata hooked up was enough. Roadmap marked retroactively done.
 
 ### 2026-04-24 — M3 #1 clarified as done, #6 RareTop estimation stat-aware
 
