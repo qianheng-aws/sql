@@ -43,7 +43,6 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.schema.Statistic;
-import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.NumberUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -136,38 +135,25 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
-   * Estimate the rowcount of a pushed-down aggregate.
+   * Estimate the rowcount of a pushed-down aggregate. Delegates to {@code mq.getRowCount
+   * ((Aggregate) digest)}, which is the logical {@link Aggregate} captured at pushdown time.
    *
-   * <p>The digest is an {@link Aggregate} captured at pushdown time. We would normally delegate to
-   * {@code mq.getRowCount(aggregate)}, but during physical planning {@code aggregate.getInput()}
-   * can be a {@code RelSubset} rather than a {@code TableScan}, and Calcite's {@link
-   * RelMdRowCount#getRowCount(Aggregate, RelMetadataQuery)} then bails to {@code inputRowCount /
-   * 10} because {@code mq.getDistinctRowCount} can't route to our handler through a subset.
+   * <p>Ideally we'd also call {@link BuiltInMetadata.DistinctRowCount.Handler} directly on {@code
+   * this} scan to bypass Calcite's {@code RelSubset}-routing gap (see design doc §6 notes on why
+   * {@code mq.getDistinctRowCount(RelSubset, ...)} returns {@code null}). But the aggregate's
+   * {@code groupSet} is relative to the aggregate's *input* row type (the original scan schema),
+   * while {@code this.getRowType()} may have been reshaped by a subsequent {@code PROJECT} pushdown
+   * — so the handler would resolve group-key indices against the wrong field names.
    *
-   * <p>Fix: consult the {@link BuiltInMetadata.DistinctRowCount.Handler} directly on *this* scan.
-   * {@code this} is the real table scan the aggregate reads from. If the handler has no stat-backed
-   * answer (no stats, empty grouping set, missing field stats), fall back to {@code
-   * mq.getRowCount(aggregate)} — which usually returns the same {@code inputRowCount / 10} default
-   * but honours any mock / override in tests.
+   * <p>For now we accept that the physical scan's {@code estimateRowCount} returns Calcite's
+   * fallback ({@code inputRowCount / 10}) when the aggregate's input has become a {@code
+   * RelSubset}. The logical-plan aggregate still gets the correct stat-backed rowcount because
+   * there the input is still a concrete {@code TableScan}, so metadata-driven consumers (join
+   * reorder, downstream aggregate metadata) see the right number.
    */
   private double aggregationRowCount(
       PushDownOperation operation, RelMetadataQuery mq, double inputRowCount) {
-    RelNode digest = (RelNode) operation.digest();
-    if (digest instanceof Aggregate aggregate) {
-      ImmutableBitSet groupKey = aggregate.getGroupSet();
-      if (groupKey.isEmpty()) {
-        return 1.0;
-      }
-      BuiltInMetadata.DistinctRowCount.Handler handler =
-          getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
-      if (handler != null) {
-        Double distinct = handler.getDistinctRowCount(this, mq, groupKey, null);
-        if (distinct != null) {
-          return distinct * aggregate.getGroupSets().size();
-        }
-      }
-    }
-    return mq.getRowCount(digest);
+    return mq.getRowCount((RelNode) operation.digest());
   }
 
   /**
@@ -282,8 +268,16 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
     double dRows = getBaselineRowCount(), dCpu = 0.0d;
     for (PushDownOperation operation : pushDownContext) {
       switch (operation.type()) {
+        // IMPORTANT: computeSelfCost intentionally keeps Calcite's default estimates
+        // (mq.getRowCount, RelMdUtil.guessSelectivity) rather than our stat-aware handlers.
+        // It feeds VolcanoPlanner's plan-selection; the external cost formula below
+        // (dRows * fields) was calibrated against these defaults. Swapping in stat-aware
+        // numbers collapses scan cost so low that VolcanoPlanner picks a partially-pushed
+        // plan (Calc + Scan) over the fully-pushed plan before ProjectIndexScanRule can
+        // fire. The stat-aware numbers are still emitted from estimateRowCount above, so
+        // metadata-driven consumers (join reorder, aggregate rowcount) see them.
         case AGGREGATION -> {
-          dRows = aggregationRowCount(operation, mq, dRows);
+          dRows = mq.getRowCount((RelNode) operation.digest());
           dCpu += dRows * getAggMultiplier(operation, pushDownContext);
         }
         // Ignored Project and Highlight in cost accumulation, but they affect the external cost
@@ -301,20 +295,14 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
           dCpu += NumberUtil.multiply(dRows, 1.1 * complexExprCount);
         }
         // Ignore cost the primitive filter but it will affect the rows count.
-        // Use stat-aware selectivity via Selectivity.Handler when available (same reasoning as
-        // the FILTER branch in estimateRowCount — otherwise cost uses Calcite's defaults even
-        // when we have per-field stats).
         case FILTER ->
             dRows =
                 NumberUtil.multiply(
                     dRows,
-                    selectivityFromHandlerOrGuess(
-                        ((FilterDigest) operation.digest()).condition(), mq));
+                    RelMdUtil.guessSelectivity(((FilterDigest) operation.digest()).condition()));
         case SCRIPT -> {
           FilterDigest filterDigest = (FilterDigest) operation.digest();
-          dRows =
-              NumberUtil.multiply(
-                  dRows, selectivityFromHandlerOrGuess(filterDigest.condition(), mq));
+          dRows = NumberUtil.multiply(dRows, RelMdUtil.guessSelectivity(filterDigest.condition()));
           // Calculate the cost of script filter by multiplying the selectivity of the filter and
           // the factor amplified by script count.
           dCpu += NumberUtil.multiply(dRows, Math.pow(1.1, filterDigest.scriptCount()));
