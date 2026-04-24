@@ -109,6 +109,8 @@ No Guice-side plumbing needed; the scheduler is self-contained and keeps the sin
    - `false` → don't schedule tick. Subscribe to the flag's update-consumer to start later if flipped.
    - `true` → `threadPool.scheduleWithFixedDelay(task, refresh_interval, ThreadPool.Names.GENERIC)`.
 
+**Why every node registers the listener.** `LocalNodeClusterManagerListener` is a *local* hook ("tell me when this node becomes / stops being cluster-manager"), not a remote subscription to the current manager. Cluster-manager identity can shift at any time (old manager crashes, network partitions, voluntary rejoin), so the listener must already be in place on every manager-eligible node for `onClusterManager()` to fire there when it's elected. If only today's manager registered, a failover would land the role on a node with no listener and the cron would never start on the new manager. On data-only nodes `onClusterManager()` never fires and the listener is an empty object in memory — same pattern as ILM / SLM in OpenSearch core, near-zero cost.
+
 ### 4.2 Tick
 
 ```
