@@ -193,6 +193,31 @@ public class OpenSearchSettings extends Settings {
           Setting.Property.NodeScope,
           Setting.Property.Dynamic);
 
+  public static final Setting<TimeValue> TABLE_STATISTICS_REFRESH_INTERVAL_SETTING =
+      Setting.timeSetting(
+          Key.TABLE_STATISTICS_REFRESH_INTERVAL.getKeyValue(),
+          TimeValue.timeValueSeconds(60),
+          TimeValue.timeValueSeconds(5),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  public static final Setting<TimeValue> TABLE_STATISTICS_TTL_SETTING =
+      Setting.timeSetting(
+          Key.TABLE_STATISTICS_TTL.getKeyValue(),
+          TimeValue.timeValueHours(24),
+          TimeValue.timeValueMinutes(1),
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
+  public static final Setting<Integer> TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT_SETTING =
+      Setting.intSetting(
+          Key.TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT.getKeyValue(),
+          4,
+          1,
+          100,
+          Setting.Property.NodeScope,
+          Setting.Property.Dynamic);
+
   public static final Setting<?> QUERY_MEMORY_LIMIT_SETTING =
       Setting.memorySizeSetting(
           Key.QUERY_MEMORY_LIMIT.getKeyValue(),
@@ -483,6 +508,24 @@ public class OpenSearchSettings extends Settings {
     register(
         settingBuilder,
         clusterSettings,
+        Key.TABLE_STATISTICS_REFRESH_INTERVAL,
+        TABLE_STATISTICS_REFRESH_INTERVAL_SETTING,
+        new Updater(Key.TABLE_STATISTICS_REFRESH_INTERVAL));
+    register(
+        settingBuilder,
+        clusterSettings,
+        Key.TABLE_STATISTICS_TTL,
+        TABLE_STATISTICS_TTL_SETTING,
+        new Updater(Key.TABLE_STATISTICS_TTL));
+    register(
+        settingBuilder,
+        clusterSettings,
+        Key.TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT,
+        TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT_SETTING,
+        new Updater(Key.TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT));
+    register(
+        settingBuilder,
+        clusterSettings,
         Key.QUERY_MEMORY_LIMIT,
         QUERY_MEMORY_LIMIT_SETTING,
         new Updater(Key.QUERY_MEMORY_LIMIT));
@@ -672,6 +715,9 @@ public class OpenSearchSettings extends Settings {
         .add(CALCITE_PUSHDOWN_ROWCOUNT_ESTIMATION_FACTOR_SETTING)
         .add(CALCITE_SUPPORT_ALL_JOIN_TYPES_SETTING)
         .add(TABLE_STATISTICS_ENABLED_SETTING)
+        .add(TABLE_STATISTICS_REFRESH_INTERVAL_SETTING)
+        .add(TABLE_STATISTICS_TTL_SETTING)
+        .add(TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT_SETTING)
         .add(DEFAULT_PATTERN_METHOD_SETTING)
         .add(DEFAULT_PATTERN_MODE_SETTING)
         .add(DEFAULT_PATTERN_MAX_SAMPLE_COUNT_SETTING)

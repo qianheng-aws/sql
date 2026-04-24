@@ -45,6 +45,9 @@ public abstract class Settings {
         "plugins.calcite.pushdown.rowcount.estimation.factor"),
     CALCITE_SUPPORT_ALL_JOIN_TYPES("plugins.calcite.all_join_types.allowed"),
     TABLE_STATISTICS_ENABLED("plugins.calcite.table_statistics.enabled"),
+    TABLE_STATISTICS_REFRESH_INTERVAL("plugins.calcite.table_statistics.refresh_interval"),
+    TABLE_STATISTICS_TTL("plugins.calcite.table_statistics.ttl"),
+    TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT("plugins.calcite.table_statistics.refresh_max_in_flight"),
 
     /** Query Settings. */
     FIELD_TYPE_TOLERANCE("plugins.query.field_type_tolerance"),
