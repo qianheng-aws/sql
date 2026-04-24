@@ -10,6 +10,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -17,10 +18,14 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.io.IOException;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.lucene.search.TotalHits;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -36,8 +41,11 @@ import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.SearchHits;
 import org.opensearch.transport.client.AdminClient;
 import org.opensearch.transport.client.IndicesAdminClient;
 import org.opensearch.transport.client.node.NodeClient;
@@ -404,6 +412,65 @@ class TableStatisticStorageTest {
 
     verify(listener).onResponse(Optional.empty());
     verify(listener, never()).onFailure(any());
+  }
+
+  // ---- listStale -----------------------------------------------------------
+
+  @Test
+  public void listStaleReturnsEmptyOnIndexNotFound() {
+    doAnswer(
+            inv -> {
+              ActionListener<SearchResponse> l = inv.getArgument(1);
+              l.onFailure(new IndexNotFoundException(".opensearch-statistics"));
+              return null;
+            })
+        .when(nodeClient)
+        .search(any(), any());
+
+    AtomicReference<List<String>> captured = new AtomicReference<>();
+    storage.listStale(
+        Duration.ofHours(1), 1000, ActionListener.wrap(captured::set, e -> fail(e.getMessage())));
+
+    assertNotNull(captured.get());
+    assertTrue(captured.get().isEmpty());
+  }
+
+  @Test
+  public void listStaleReturnsIndexNamesFromHits() throws IOException {
+    SearchHit hit1 = new SearchHit(1);
+    hit1.sourceRef(
+        org.opensearch.core.common.bytes.BytesReference.bytes(
+            org.opensearch.common.xcontent.XContentFactory.jsonBuilder()
+                .startObject()
+                .field("index_name", "logs-a")
+                .endObject()));
+    SearchHit hit2 = new SearchHit(2);
+    hit2.sourceRef(
+        org.opensearch.core.common.bytes.BytesReference.bytes(
+            org.opensearch.common.xcontent.XContentFactory.jsonBuilder()
+                .startObject()
+                .field("index_name", "logs-b")
+                .endObject()));
+    SearchHits hits =
+        new SearchHits(
+            new SearchHit[] {hit1, hit2}, new TotalHits(2, TotalHits.Relation.EQUAL_TO), 1.0f);
+    SearchResponse resp = mock(SearchResponse.class);
+    when(resp.getHits()).thenReturn(hits);
+
+    doAnswer(
+            inv -> {
+              ActionListener<SearchResponse> l = inv.getArgument(1);
+              l.onResponse(resp);
+              return null;
+            })
+        .when(nodeClient)
+        .search(any(), any());
+
+    AtomicReference<List<String>> captured = new AtomicReference<>();
+    storage.listStale(
+        Duration.ofHours(1), 1000, ActionListener.wrap(captured::set, e -> fail(e.getMessage())));
+
+    assertEquals(List.of("logs-a", "logs-b"), captured.get());
   }
 
   // ---- mocking helpers -----------------------------------------------------

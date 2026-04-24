@@ -7,8 +7,12 @@ package org.opensearch.sql.opensearch.storage.statistics;
 
 import com.google.common.hash.Hashing;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import org.apache.logging.log4j.LogManager;
@@ -23,8 +27,14 @@ import org.opensearch.action.get.GetRequest;
 import org.opensearch.action.get.GetResponse;
 import org.opensearch.action.index.IndexRequest;
 import org.opensearch.action.index.IndexResponse;
+import org.opensearch.action.search.SearchRequest;
+import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
 import org.opensearch.index.IndexNotFoundException;
+import org.opensearch.index.query.BoolQueryBuilder;
+import org.opensearch.index.query.QueryBuilders;
+import org.opensearch.search.SearchHit;
+import org.opensearch.search.builder.SearchSourceBuilder;
 import org.opensearch.transport.client.node.NodeClient;
 
 /**
@@ -158,6 +168,62 @@ public class TableStatisticStorage {
                   e.getMessage());
             }
             listener.onResponse(Optional.empty());
+          }
+        });
+  }
+
+  /**
+   * List index names whose stored stat is stale (older than {@code ttl}) and whose status is
+   * actionable ({@code COMPLETED} or {@code FAILED} — {@code GENERATING} is skipped since the
+   * collector has its own abandonment logic).
+   *
+   * <p>Returns an empty list on missing storage index or any transport failure. Never calls {@code
+   * onFailure}. {@code maxResults} caps the page size; if the sweep ever returns exactly {@code
+   * maxResults}, the next tick will pick up the remainder.
+   */
+  public void listStale(Duration ttl, int maxResults, ActionListener<List<String>> listener) {
+    long cutoffMillis = System.currentTimeMillis() - ttl.toMillis();
+    BoolQueryBuilder query =
+        QueryBuilders.boolQuery()
+            .filter(
+                QueryBuilders.termsQuery(
+                    "status", TableStatistic.STATUS_COMPLETED, TableStatistic.STATUS_FAILED))
+            .filter(QueryBuilders.rangeQuery("last_updated_time").lt(cutoffMillis));
+    SearchRequest request =
+        new SearchRequest(STORAGE_INDEX)
+            .source(
+                new SearchSourceBuilder()
+                    .query(query)
+                    .size(maxResults)
+                    .fetchSource(new String[] {"index_name"}, null)
+                    .trackTotalHits(false));
+    nodeClient.search(
+        request,
+        new ActionListener<SearchResponse>() {
+          @Override
+          public void onResponse(SearchResponse response) {
+            List<String> names = new ArrayList<>();
+            for (SearchHit hit : response.getHits().getHits()) {
+              Object name =
+                  hit.getSourceAsMap() == null ? null : hit.getSourceAsMap().get("index_name");
+              if (name instanceof String s && !s.isEmpty()) {
+                names.add(s);
+              }
+            }
+            listener.onResponse(names);
+          }
+
+          @Override
+          public void onFailure(Exception e) {
+            if (ExceptionsHelper.unwrap(e, IndexNotFoundException.class) != null) {
+              LOG.debug("Statistics index {} does not exist yet", STORAGE_INDEX);
+            } else {
+              LOG.warn(
+                  "Failed to listStale stat docs ({}): {}",
+                  e.getClass().getSimpleName(),
+                  e.getMessage());
+            }
+            listener.onResponse(Collections.emptyList());
           }
         });
   }
