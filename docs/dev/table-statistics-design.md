@@ -313,10 +313,10 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ### Milestone 4 — Productionization
 
 - [x] **Integration tests.** Covered by `TableStatisticsIT` (`9fed71941`). Exercises flag off / flag on without analyze / after analyze / REST read.
-- [ ] **Replace ml-commons plan references.** The `docs/superpowers/plans/2026-04-20-index-insight-ppl-integration*.md` files are historical. Either archive or convert into a retrospective.
-- [ ] **Permission model.** Who is allowed to call `POST /_statistics/{index}/analyze`? Today it inherits the SQL plugin ACL; a dedicated security action may be warranted.
-- [ ] **Metrics.** Expose `stat_refresh_total{status}`, `stat_refresh_latency_ms`, `stat_read_timeout_total` through the existing SQL metrics surface.
-- [ ] **Documentation.** User-facing doc under `docs/user/` describing the flag, the REST API, and operational guidance. Dev doc (this file) lives under `docs/dev/`.
+- [x] **Archived ml-commons plan references.** Moved the 2026-04-20 plans into `docs/superpowers/plans/archive/` with a README.
+- [ ] **Permission model.** Deferred to post-merge — SQL plugin's existing REST handlers all rely on `opensearch-security` as a transparent interceptor, with no per-plugin action names defined. Introducing one for `/analyze` alone would deviate from the plugin's current posture; worth doing if a security-conscious operator requests it upstream.
+- [x] **Metrics.** Three flat counters exposed through `/_plugins/_ppl/stats`: `table_statistics_refresh_success_count`, `table_statistics_refresh_failure_count`, `table_statistics_read_timeout_count`. Rejection-skip (cluster busy) is explicitly not counted as failure.
+- [x] **Documentation.** `docs/user/optimization/table-statistics.rst` covers concept / REST / operations; `docs/user/admin/settings.rst` has entries for all 5 settings.
 
 ### Milestone 5 — Upstream PR
 
@@ -329,6 +329,15 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-24 — M4 productionization
+
+Four of five M4 items landed in a single pass, one explicitly deferred:
+
+- **ml-commons plan archive** — moved the 2026-04-20 plans into `docs/superpowers/plans/archive/`.
+- **Metrics** — three flat counters in the legacy `Metrics` singleton, routed through `/_plugins/_ppl/stats`. Wired via a `TableStatisticCollector.Hooks` callback interface because `opensearch` module cannot depend on `:legacy` (would be cyclic). Live-verified: `success_count` went 0 → 1 after a single `/analyze`.
+- **User documentation** — `docs/user/optimization/table-statistics.rst` covers concept + REST API + operational guidance; `docs/user/admin/settings.rst` documents all 5 settings under the existing `plugins.calcite.*` family.
+- **Permission model** — deferred to post-merge; the SQL plugin's existing REST handlers all rely on `opensearch-security` as a transparent interceptor with no per-plugin action names defined. Introducing one for `/analyze` alone would deviate from the plugin's current posture.
 
 ### 2026-04-24 — M3 #5 Join reorder verified working
 

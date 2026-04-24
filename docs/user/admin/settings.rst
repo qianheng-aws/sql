@@ -960,3 +960,90 @@ Join types ``inner``, ``left``, ``outer`` (alias of ``left``), ``semi`` and ``an
 1. The default value is false since 3.3.0.
 2. This setting is node scope.
 3. This setting can be updated dynamically.
+
+plugins.calcite.table_statistics.enabled
+========================================
+
+Version
+-------
+3.4
+
+Description
+-----------
+
+Enable the table-statistics subsystem. When enabled, the Calcite optimizer consumes stored per-index / per-field statistics (row count, cardinality, min/max, null ratio) so that join reorder, filter selectivity, and aggregate rowcount reflect real data. When disabled, the optimizer falls back to Calcite's default heuristics.
+
+1. The default value is false since 3.4.0.
+2. This setting is node scope.
+3. This setting can be updated dynamically.
+4. Has no effect when ``plugins.calcite.enabled`` is false — the subsystem is only consumed by the Calcite optimizer path.
+
+See the `Table Statistics <../optimization/table-statistics.rst>`_ guide for usage and operational details.
+
+plugins.calcite.table_statistics.refresh_interval
+=================================================
+
+Version
+-------
+3.4
+
+Description
+-----------
+
+How often the cluster-manager node scans for stale statistics and triggers background refresh. Only takes effect when ``plugins.calcite.table_statistics.enabled`` is true.
+
+1. The default value is 60s since 3.4.0.
+2. The minimum allowed value is 5s.
+3. This setting is node scope.
+4. This setting can be updated dynamically.
+
+plugins.calcite.table_statistics.ttl
+====================================
+
+Version
+-------
+3.4
+
+Description
+-----------
+
+A statistic older than this is considered stale. Query-path consumers continue to use stale statistics until a fresh record is written — cron-triggered refresh keeps them within one TTL interval under steady load.
+
+1. The default value is 24h since 3.4.0.
+2. The minimum allowed value is 1m.
+3. This setting is node scope.
+4. This setting can be updated dynamically.
+
+plugins.calcite.table_statistics.refresh_max_in_flight
+======================================================
+
+Version
+-------
+3.4
+
+Description
+-----------
+
+Upper bound on the number of concurrent background refreshes on the cluster-manager node. Each refresh issues one OpenSearch ``_search`` request against the target index, so this cap also bounds the subsystem's load on the search thread pool.
+
+1. The default value is 4 since 3.4.0.
+2. Allowed range: 1 to 100.
+3. This setting is node scope.
+4. This setting can be updated dynamically.
+
+plugins.calcite.table_statistics.sampler_shard_size
+===================================================
+
+Version
+-------
+3.4
+
+Description
+-----------
+
+Per-shard document cap for the sampler aggregation used to compute approximate distinct counts. Larger values improve HLL accuracy on skewed data at the cost of more memory during collection.
+
+1. The default value is 100000 since 3.4.0.
+2. The minimum allowed value is 1000.
+3. This setting is node scope.
+4. This setting can be updated dynamically.

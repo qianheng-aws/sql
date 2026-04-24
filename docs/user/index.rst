@@ -53,6 +53,8 @@ OpenSearch SQL enables you to extract insights out of OpenSearch using the famil
 
   - `Optimization <optimization/optimization.rst>`_
 
+  - `Table Statistics <optimization/table-statistics.rst>`_
+
 * **Troubleshooting**
 
   - `Troubleshooting <dql/troubleshooting.rst>`_
