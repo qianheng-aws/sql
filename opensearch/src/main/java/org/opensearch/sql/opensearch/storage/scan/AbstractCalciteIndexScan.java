@@ -43,6 +43,7 @@ import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rex.RexCall;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.schema.Statistic;
+import org.apache.calcite.util.ImmutableBitSet;
 import org.apache.calcite.util.NumberUtil;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -135,49 +136,54 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
-   * Estimate the rowcount of a pushed-down aggregate. Current implementation delegates to {@code
-   * mq.getRowCount((Aggregate) digest)}, which during physical planning falls back to {@code
-   * inputRowCount / 10} because {@code aggregate.getInput()} has become a {@code RelSubset} and
-   * Calcite can't route {@code mq.getDistinctRowCount} through it to our handler.
+   * Estimate the rowcount of a pushed-down aggregate using stat-backed cardinality when available.
    *
-   * <p>FIXME — the stat-aware version below produces a smaller, correct rowcount, but doing so
-   * destabilises VolcanoPlanner's rule-firing order in ways that break project pushdown for some
-   * aggregate queries (e.g. {@code stats count() by status, region}). Root cause: the
-   * scan-aggregation-project-limit-cost-in-a-single-self-cost design amplifies cost changes, which
-   * distorts Calcite's importance-based rule-firing heuristics. See design doc §6 BUG-003 / BUG-004
-   * notes for the diagnostic analysis and the scan-cost-redesign follow-up.
+   * <p>The aggregate's {@code groupSet} indexes into the aggregate's <em>input</em> row type, so we
+   * pass the pre-agg {@link TableScan} to the handler rather than {@code this} — a later PROJECT
+   * pushdown reshapes {@code this.getRowType()} and would break the field-name lookup.
    *
-   * <p>To iterate on the fix, swap in the stat-aware body below (and uncomment the {@code
-   * ImmutableBitSet} import):
-   *
-   * <pre>{@code
-   * RelNode digest = (RelNode) operation.digest();
-   * if (digest instanceof Aggregate aggregate) {
-   *   ImmutableBitSet groupKey = aggregate.getGroupSet();
-   *   if (groupKey.isEmpty()) {
-   *     return 1.0;
-   *   }
-   *   BuiltInMetadata.DistinctRowCount.Handler handler =
-   *       getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
-   *   if (handler != null) {
-   *     // NOTE: uses `this` as the rel, so the handler resolves groupKey indices against
-   *     // `this.getRowType()`. If a PROJECT has been pushed down, this row type is the
-   *     // aggregate's output schema — NOT the original scan schema the groupKey references —
-   *     // so the field-name lookup picks up wrong columns. To really get this working you'd
-   *     // also need to either (a) look up field names against the pre-agg schema, or (b) route
-   *     // through the aggregate's original input scan.
-   *     Double distinct = handler.getDistinctRowCount(this, mq, groupKey, null);
-   *     if (distinct != null) {
-   *       return distinct * aggregate.getGroupSets().size();
-   *     }
-   *   }
-   * }
-   * return mq.getRowCount(digest);
-   * }</pre>
+   * <p>TODO(table-statistics): unify rowcount sourcing between this method and {@link
+   * #computeSelfCost}. Today they diverge: cost uses Calcite's default {@code mq.getRowCount
+   * (digest)} fallback, this method returns the stat-backed number. Feeding the stat-backed value
+   * into {@code computeSelfCost} destabilises VolcanoPlanner — scan self-cost drops enough that the
+   * partially-pushed plan (Calc + Scan) wins before {@code ProjectIndexScanRule} fires. A proper
+   * fix likely means redesigning scan self-cost so a stat-improved rowcount no longer dominates
+   * rule importance.
    */
   private double aggregationRowCount(
       PushDownOperation operation, RelMetadataQuery mq, double inputRowCount) {
-    return mq.getRowCount((RelNode) operation.digest());
+    RelNode digest = (RelNode) operation.digest();
+    if (digest instanceof Aggregate aggregate) {
+      ImmutableBitSet groupKey = aggregate.getGroupSet();
+      if (groupKey.isEmpty()) {
+        return 1.0;
+      }
+      BuiltInMetadata.DistinctRowCount.Handler handler =
+          getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
+      TableScan preAggScan = findTableScan(aggregate.getInput());
+      if (handler != null && preAggScan != null) {
+        Double distinct = handler.getDistinctRowCount(preAggScan, mq, groupKey, null);
+        if (distinct != null) {
+          return distinct * aggregate.getGroupSets().size();
+        }
+      }
+    }
+    return mq.getRowCount(digest);
+  }
+
+  /** Walk a {@code RelSubset} / unmodified rel to find the underlying {@link TableScan}. */
+  private static @Nullable TableScan findTableScan(RelNode rel) {
+    if (rel instanceof TableScan scan) {
+      return scan;
+    }
+    if (rel instanceof org.apache.calcite.plan.volcano.RelSubset subset) {
+      for (RelNode member : subset.getRelList()) {
+        if (member instanceof TableScan scan) {
+          return scan;
+        }
+      }
+    }
+    return null;
   }
 
   /**
@@ -292,14 +298,9 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
     double dRows = getBaselineRowCount(), dCpu = 0.0d;
     for (PushDownOperation operation : pushDownContext) {
       switch (operation.type()) {
-        // IMPORTANT: computeSelfCost intentionally keeps Calcite's default estimates
-        // (mq.getRowCount, RelMdUtil.guessSelectivity) rather than our stat-aware handlers.
-        // It feeds VolcanoPlanner's plan-selection; the external cost formula below
-        // (dRows * fields) was calibrated against these defaults. Swapping in stat-aware
-        // numbers collapses scan cost so low that VolcanoPlanner picks a partially-pushed
-        // plan (Calc + Scan) over the fully-pushed plan before ProjectIndexScanRule can
-        // fire. The stat-aware numbers are still emitted from estimateRowCount above, so
-        // metadata-driven consumers (join reorder, aggregate rowcount) see them.
+        // TODO(table-statistics): see aggregationRowCount javadoc — cost deliberately uses
+        // mq.getRowCount's Calcite-default fallback so VolcanoPlanner's plan selection stays
+        // stable. Unify once scan self-cost is redesigned.
         case AGGREGATION -> {
           dRows = mq.getRowCount((RelNode) operation.digest());
           dCpu += dRows * getAggMultiplier(operation, pushDownContext);
