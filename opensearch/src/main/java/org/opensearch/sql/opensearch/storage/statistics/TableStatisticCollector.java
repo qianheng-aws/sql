@@ -107,16 +107,36 @@ public class TableStatisticCollector {
 
   private static final ActionListener<Void> NOOP_COMPLETION = ActionListener.wrap(v -> {}, e -> {});
 
+  /**
+   * Observability hooks. The {@code opensearch} module cannot depend on {@code :legacy} (it would
+   * create a cycle), so the collector accepts per-event callbacks and the plugin wires them to the
+   * real {@link org.opensearch.sql.legacy.metrics.Metrics} singleton.
+   */
+  public interface Hooks {
+    Hooks NOOP = new Hooks() {};
+
+    default void onRefreshSuccess() {}
+
+    default void onRefreshFailure() {}
+
+    default void onReadTimeout() {}
+  }
+
+  public Hooks getHooks() {
+    return hooks;
+  }
+
   private final NodeClient nodeClient;
   private final TableStatisticStorage storage;
   private final IntSupplier samplerShardSize;
+  private final Hooks hooks;
 
   /**
-   * Construct with a fixed sampler shard-size ({@value #DEFAULT_SAMPLER_SHARD_SIZE}). Used by tests
-   * and as a fallback when no settings source is wired.
+   * Construct with a fixed sampler shard-size ({@value #DEFAULT_SAMPLER_SHARD_SIZE}) and no metric
+   * hooks. Used by tests and as a fallback when no settings source is wired.
    */
   public TableStatisticCollector(NodeClient nodeClient, TableStatisticStorage storage) {
-    this(nodeClient, storage, () -> DEFAULT_SAMPLER_SHARD_SIZE);
+    this(nodeClient, storage, () -> DEFAULT_SAMPLER_SHARD_SIZE, Hooks.NOOP);
   }
 
   /**
@@ -124,10 +144,14 @@ public class TableStatisticCollector {
    * aggregation request. Dynamic setting updates take effect on the next refresh.
    */
   public TableStatisticCollector(
-      NodeClient nodeClient, TableStatisticStorage storage, IntSupplier samplerShardSize) {
+      NodeClient nodeClient,
+      TableStatisticStorage storage,
+      IntSupplier samplerShardSize,
+      Hooks hooks) {
     this.nodeClient = nodeClient;
     this.storage = storage;
     this.samplerShardSize = samplerShardSize;
+    this.hooks = hooks;
   }
 
   /**
@@ -192,6 +216,7 @@ public class TableStatisticCollector {
     } catch (RuntimeException e) {
       LOG.warn("Failed to build aggregation request for {}: {}", indexName, e.getMessage());
       storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+      incrementFailure();
       completion.onResponse(null);
       return;
     }
@@ -207,6 +232,7 @@ public class TableStatisticCollector {
             } catch (RuntimeException e) {
               LOG.warn("Failed to parse statistic response for {}: {}", indexName, e.getMessage());
               storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+              incrementFailure();
               completion.onResponse(null);
               return;
             }
@@ -221,6 +247,7 @@ public class TableStatisticCollector {
                         indexName,
                         stat.getDocCount(),
                         stat.getFields().size());
+                    incrementSuccess();
                     completion.onResponse(null);
                   }
 
@@ -229,6 +256,7 @@ public class TableStatisticCollector {
                     LOG.warn("Failed to persist statistic for {}: {}", indexName, e.getMessage());
                     storage.putStatus(
                         indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+                    incrementFailure();
                     completion.onResponse(null);
                   }
                 });
@@ -245,9 +273,18 @@ public class TableStatisticCollector {
             }
             LOG.warn("Failed to collect statistic for {}: {}", indexName, e.getMessage());
             storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+            incrementFailure();
             completion.onResponse(null);
           }
         });
+  }
+
+  private void incrementSuccess() {
+    hooks.onRefreshSuccess();
+  }
+
+  private void incrementFailure() {
+    hooks.onRefreshFailure();
   }
 
   /**

@@ -283,6 +283,9 @@ public class OpenSearchIndex extends AbstractOpenSearchTable {
     try {
       if (!latch.await(STORAGE_READ_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
         LOG.debug("Timed out reading statistic for {}", rawIndexName);
+        if (statisticCollector != null) {
+          statisticCollector.getHooks().onReadTimeout();
+        }
         triggerRefreshIfNeeded();
         return cacheAndReturn(Statistics.UNKNOWN);
       }

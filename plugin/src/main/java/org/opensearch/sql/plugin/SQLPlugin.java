@@ -287,7 +287,35 @@ public class SQLPlugin extends Plugin
             () ->
                 pluginSettings.getSettingValue(
                     org.opensearch.sql.common.setting.Settings.Key
-                        .TABLE_STATISTICS_SAMPLER_SHARD_SIZE));
+                        .TABLE_STATISTICS_SAMPLER_SHARD_SIZE),
+            new TableStatisticCollector.Hooks() {
+              @Override
+              public void onRefreshSuccess() {
+                org.opensearch.sql.legacy.metrics.Metrics.getInstance()
+                    .getNumericalMetric(
+                        org.opensearch.sql.legacy.metrics.MetricName
+                            .TABLE_STATISTICS_REFRESH_SUCCESS_COUNT)
+                    .increment();
+              }
+
+              @Override
+              public void onRefreshFailure() {
+                org.opensearch.sql.legacy.metrics.Metrics.getInstance()
+                    .getNumericalMetric(
+                        org.opensearch.sql.legacy.metrics.MetricName
+                            .TABLE_STATISTICS_REFRESH_FAILURE_COUNT)
+                    .increment();
+              }
+
+              @Override
+              public void onReadTimeout() {
+                org.opensearch.sql.legacy.metrics.Metrics.getInstance()
+                    .getNumericalMetric(
+                        org.opensearch.sql.legacy.metrics.MetricName
+                            .TABLE_STATISTICS_READ_TIMEOUT_COUNT)
+                    .increment();
+              }
+            });
     TableStatisticsMappingResolver mappingResolver =
         new TableStatisticsMappingResolver(this.client);
     this.tableStatisticRefreshScheduler =
