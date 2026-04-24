@@ -135,21 +135,45 @@ public abstract class AbstractCalciteIndexScan extends TableScan implements Alia
   }
 
   /**
-   * Estimate the rowcount of a pushed-down aggregate. Delegates to {@code mq.getRowCount
-   * ((Aggregate) digest)}, which is the logical {@link Aggregate} captured at pushdown time.
+   * Estimate the rowcount of a pushed-down aggregate. Current implementation delegates to {@code
+   * mq.getRowCount((Aggregate) digest)}, which during physical planning falls back to {@code
+   * inputRowCount / 10} because {@code aggregate.getInput()} has become a {@code RelSubset} and
+   * Calcite can't route {@code mq.getDistinctRowCount} through it to our handler.
    *
-   * <p>Ideally we'd also call {@link BuiltInMetadata.DistinctRowCount.Handler} directly on {@code
-   * this} scan to bypass Calcite's {@code RelSubset}-routing gap (see design doc §6 notes on why
-   * {@code mq.getDistinctRowCount(RelSubset, ...)} returns {@code null}). But the aggregate's
-   * {@code groupSet} is relative to the aggregate's *input* row type (the original scan schema),
-   * while {@code this.getRowType()} may have been reshaped by a subsequent {@code PROJECT} pushdown
-   * — so the handler would resolve group-key indices against the wrong field names.
+   * <p>FIXME — the stat-aware version below produces a smaller, correct rowcount, but doing so
+   * destabilises VolcanoPlanner's rule-firing order in ways that break project pushdown for some
+   * aggregate queries (e.g. {@code stats count() by status, region}). Root cause: the
+   * scan-aggregation-project-limit-cost-in-a-single-self-cost design amplifies cost changes, which
+   * distorts Calcite's importance-based rule-firing heuristics. See design doc §6 BUG-003 / BUG-004
+   * notes for the diagnostic analysis and the scan-cost-redesign follow-up.
    *
-   * <p>For now we accept that the physical scan's {@code estimateRowCount} returns Calcite's
-   * fallback ({@code inputRowCount / 10}) when the aggregate's input has become a {@code
-   * RelSubset}. The logical-plan aggregate still gets the correct stat-backed rowcount because
-   * there the input is still a concrete {@code TableScan}, so metadata-driven consumers (join
-   * reorder, downstream aggregate metadata) see the right number.
+   * <p>To iterate on the fix, swap in the stat-aware body below (and uncomment the {@code
+   * ImmutableBitSet} import):
+   *
+   * <pre>{@code
+   * RelNode digest = (RelNode) operation.digest();
+   * if (digest instanceof Aggregate aggregate) {
+   *   ImmutableBitSet groupKey = aggregate.getGroupSet();
+   *   if (groupKey.isEmpty()) {
+   *     return 1.0;
+   *   }
+   *   BuiltInMetadata.DistinctRowCount.Handler handler =
+   *       getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
+   *   if (handler != null) {
+   *     // NOTE: uses `this` as the rel, so the handler resolves groupKey indices against
+   *     // `this.getRowType()`. If a PROJECT has been pushed down, this row type is the
+   *     // aggregate's output schema — NOT the original scan schema the groupKey references —
+   *     // so the field-name lookup picks up wrong columns. To really get this working you'd
+   *     // also need to either (a) look up field names against the pre-agg schema, or (b) route
+   *     // through the aggregate's original input scan.
+   *     Double distinct = handler.getDistinctRowCount(this, mq, groupKey, null);
+   *     if (distinct != null) {
+   *       return distinct * aggregate.getGroupSets().size();
+   *     }
+   *   }
+   * }
+   * return mq.getRowCount(digest);
+   * }</pre>
    */
   private double aggregationRowCount(
       PushDownOperation operation, RelMetadataQuery mq, double inputRowCount) {
