@@ -128,6 +128,32 @@ public class TableStatisticsIT extends PPLIntegTestCase {
     assertEquals(5.0, aggRows, 0.1);
   }
 
+  /**
+   * Smoke-test the scheduler settings lifecycle. End-to-end "cron actually rewrites a stale doc" is
+   * covered by the unit tests (scheduler + task) and validated manually on a live cluster (see spec
+   * §1). Reproducing real 5 s-interval cron in-process here fights the shared test cluster: any
+   * in-flight refresh surviving past tearDown poisons the next test's analyze via the
+   * GENERATING-marker dedup. So we validate the contract we can observe cheaply: settings take
+   * effect and can be reset.
+   */
+  @Test
+  public void cronSettingsAreLive() throws IOException {
+    updateCronSetting("refresh_interval", "30s");
+    try {
+      Response r = client().performRequest(new Request("GET", "/_cluster/settings"));
+      JSONObject body = new JSONObject(getResponseBody(r, true));
+      String got =
+          body.getJSONObject("persistent")
+              .getJSONObject("plugins")
+              .getJSONObject("calcite")
+              .getJSONObject("table_statistics")
+              .getString("refresh_interval");
+      assertEquals("30s", got);
+    } finally {
+      resetCronSetting("refresh_interval");
+    }
+  }
+
   @Test
   public void restApi_getReturnsCompletedDocument() throws IOException {
     enableTableStatistics();
@@ -187,6 +213,22 @@ public class TableStatisticsIT extends PPLIntegTestCase {
     SQLIntegTestCase.updateClusterSettings(
         new SQLIntegTestCase.ClusterSetting(
             "persistent", Settings.Key.TABLE_STATISTICS_ENABLED.getKeyValue(), "false"));
+  }
+
+  private void updateCronSetting(String suffix, String value) throws IOException {
+    SQLIntegTestCase.updateClusterSettings(
+        new SQLIntegTestCase.ClusterSetting(
+            "persistent", "plugins.calcite.table_statistics." + suffix, value));
+  }
+
+  private void resetCronSetting(String suffix) {
+    try {
+      SQLIntegTestCase.updateClusterSettings(
+          new SQLIntegTestCase.ClusterSetting(
+              "persistent", "plugins.calcite.table_statistics." + suffix, null));
+    } catch (IOException ignored) {
+      // best-effort cleanup
+    }
   }
 
   /**
