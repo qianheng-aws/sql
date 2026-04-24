@@ -305,10 +305,10 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 - [x] **#2 Aggregate row count** — `DistinctRowCount.Handler` via `unwrap`. Shipped (`eef8697c1`).
 - [x] **#3 Filter selectivity (equality/null)** — `Selectivity.Handler` via `unwrap`. Shipped (`545bc7d63`): `col = literal → 1/cardinality`, `IS NULL → nullRatio`, `IS NOT NULL → 1 - nullRatio`.
 - [x] **#3 Filter selectivity (range)** — M2 Phase 1b, linear interpolation over stored `[min, max]` + `RexUtil.expandSearch` for `BETWEEN` / Sarg.
-- [ ] **#1 TableScan row count override.** Right now `AbstractCalciteIndexScan.estimateRowCount` reads `TableStatistic.getRowCount()` via `getStatistic()`. That is good. But `maxResultWindow` is still the fallback — promote the stored `doc_count` higher up so even non-Calcite paths benefit.
+- [x] **#1 TableScan row count override** — `AbstractCalciteIndexScan.getBaselineRowCount()` already consumes `TableStatistic.getRowCount()` with `maxResultWindow` as the UNKNOWN fallback; all rowcount consumers (join reorder, aggregate metadata) route through `RelMetadataQuery` into this method. The roadmap's earlier "non-Calcite paths benefit" framing was an artifact — V2 has no cost-based planner to benefit, so nothing to promote.
 - [ ] **#4 Histogram-backed selectivity** — replace the uniform-distribution min/max formula with equi-height histograms (~50 buckets per numeric/date field). See §3.4. Gated on real ROI, expected to be driven by multi-plan candidate generation in JOIN scenarios.
 - [ ] **#5 Join reorder hints.** With both sides carrying stats, we can reorder joins by smaller-input-first. Requires the metadata handlers above plus verified handling of non-null join predicates.
-- [ ] **#6 `RareTop` / `top_n` quality.** `RareTopDigest` currently uses a fixed factor; with cardinality we can short-circuit pushdown decisions.
+- [x] **#6 `RareTop` / `top_n` quality** — `AbstractCalciteIndexScan.estimateRowCount`'s RARE_TOP branch now uses `min(N, rowCount)` for no-by, and `min(N × numDistinctVals(Π cardinality, rowCount), rowCount)` for one-or-more `by` columns. Falls back to the legacy heuristic when any `by` column lacks stats.
 
 ### Milestone 4 — Productionization
 
@@ -329,6 +329,22 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-24 — M3 #1 clarified as done, #6 RareTop estimation stat-aware
+
+`#1 TableScan row count override` was already satisfied by
+`AbstractCalciteIndexScan.getBaselineRowCount()` since POC; the "non-Calcite paths benefit"
+framing in the original roadmap was an artifact. Marked done retroactively.
+
+`#6 RareTop quality` — replaced the fixed `(1 - 0.5^G)` heuristic with stat-backed NDV:
+- No `by` columns: `min(N, rowCount)` (clamps the tiny-table edge case; `top 100 x` on a
+  5-row index was previously reporting 100 rows).
+- With `by` columns: `min(N × numDistinctVals(Π cardinality, rowCount), rowCount)`, reusing
+  Calcite's inclusion-exclusion formula that M3 #2 aggregate rowcount already uses.
+- Graceful fallback to the legacy heuristic when any `by` column has no stored cardinality.
+
+Four unit cases land with it; no live-cluster verification yet — will bundle with the next
+batch of PPL explain snapshots.
 
 ### 2026-04-24 — M2 Phase 3 partial: null_ratio + sampler setting
 
