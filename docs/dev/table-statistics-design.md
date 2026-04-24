@@ -567,3 +567,66 @@ New unit tests (`test_filter_pushdown_uses_stat_aware_selectivity_when_handler_a
 `test_aggregate_pushdown_uses_distinct_row_count_handler_when_available`) lock in the
 invariant that the handler is reachable from the scan's own rowcount logic, not only from the
 logical-plan `RelMd*` dispatch.
+
+### Design note: why a local `unwrap` on `this` scan instead of a custom `RelMetadataProvider`?
+
+When BUG-003 was fixed, the more systematic alternative considered and rejected was registering a
+custom `RelMetadataProvider` that handles `RelSubset` in `RelMdDistinctRowCount` /
+`RelMdSelectivity` — something like:
+
+```java
+public class OpenSearchRelMdDistinctRowCount {
+    public Double getDistinctRowCount(
+        RelSubset subset, RelMetadataQuery mq,
+        ImmutableBitSet groupKey, RexNode predicate) {
+        for (RelNode rel : subset.getRelList()) {
+            if (rel instanceof TableScan scan) {
+                BuiltInMetadata.DistinctRowCount.Handler h =
+                    scan.getTable().unwrap(BuiltInMetadata.DistinctRowCount.Handler.class);
+                if (h != null) {
+                    return h.getDistinctRowCount(scan, mq, groupKey, predicate);
+                }
+            }
+        }
+        return null;
+    }
+}
+// + cluster.setMetadataProvider(ChainedRelMetadataProvider.of(...))
+```
+
+That would be the "correct by Calcite convention" path — any consumer of
+`RelMetadataQuery.getDistinctRowCount(...)` would benefit, including potential future Calcite-
+internal callers we don't control today. But the local `unwrap` on `this` scan wins on these
+trade-offs:
+
+1. **Scope of change.** Our fix only affects `AbstractCalciteIndexScan`. A global metadata
+   provider would intercept `DistinctRowCount` / `Selectivity` for *every* `RelSubset` across the
+   whole session — including the Prometheus / Glue / SecurityLake datasources. The fallback path
+   would have to be carefully written to not break them. Today's fix has zero blast radius.
+2. **Calcite Janino pain.** `ReflectiveRelMetadataProvider` compiles dispatchers via Janino at
+   runtime. Debugging dispatch failures is painful (stack traces point at generated source, no
+   IDE support). The plugin currently avoids this surface area entirely; adding a custom provider
+   would be a first.
+3. **Reviewer friction.** Upstream reviewers would ask "does this affect other engines?" and
+   "why not `unwrap`?" — the `unwrap` answer is short and already scoped. Custom metadata provider
+   would lengthen review.
+4. **Only one or two known consumers.** The only sites that actually hit
+   `mq.getDistinctRowCount(subset, ...)` in our plans today are `RelMdRowCount.getRowCount
+   (Aggregate)` and (potentially) join reorder rules. Aggregate is covered by
+   `aggregationRowCount`; join reorder is already working (50 vs 2000 swap, §7 demo), so the
+   metadata path there is fine. Expanding coverage via a provider would currently catch zero
+   additional bugs.
+
+**When this decision should be revisited:**
+
+- A third or fourth class of this bug appears — i.e. local `unwrap` starts turning into a
+  per-site whack-a-mole.
+- Join reorder rowcount observably breaks in a real scenario (i.e. `mq.getRowCount(join)` or
+  downstream metadata path starts returning fallback numbers we can't fix at the scan).
+- Another OpenSearch storage engine (or upstream contribution) needs stats with the same
+  subset-routing problem — then a shared provider becomes more ergonomic than duplicating
+  `unwrap` wiring in each scan.
+
+At the point any of those materialise, the refactor to a provider is incremental — the existing
+`unwrap` helpers can co-exist until the provider is proven correct, then be removed. So sticking
+with local `unwrap` today does not burn a bridge.
