@@ -96,7 +96,9 @@ import org.opensearch.sql.opensearch.setting.OpenSearchSettings;
 import org.opensearch.sql.opensearch.storage.OpenSearchDataSourceFactory;
 import org.opensearch.sql.opensearch.storage.script.CompoundedScriptEngine;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticCollector;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticRefreshScheduler;
 import org.opensearch.sql.opensearch.storage.statistics.TableStatisticStorage;
+import org.opensearch.sql.opensearch.storage.statistics.TableStatisticsMappingResolver;
 import org.opensearch.sql.plugin.config.EngineExtensionsHolder;
 import org.opensearch.sql.plugin.config.OpenSearchPluginModule;
 import org.opensearch.sql.plugin.rest.RestPPLGrammarAction;
@@ -152,6 +154,7 @@ public class SQLPlugin extends Plugin
   private Injector injector;
   private TableStatisticStorage tableStatisticStorage;
   private TableStatisticCollector tableStatisticCollector;
+  private TableStatisticRefreshScheduler tableStatisticRefreshScheduler;
 
   public String name() {
     return "sql";
@@ -279,6 +282,32 @@ public class SQLPlugin extends Plugin
     this.tableStatisticStorage = new TableStatisticStorage(this.client);
     this.tableStatisticCollector =
         new TableStatisticCollector(this.client, this.tableStatisticStorage);
+    TableStatisticsMappingResolver mappingResolver =
+        new TableStatisticsMappingResolver(this.client);
+    this.tableStatisticRefreshScheduler =
+        new TableStatisticRefreshScheduler(
+            clusterService,
+            threadPool,
+            (OpenSearchSettings) pluginSettings,
+            tableStatisticStorage,
+            tableStatisticCollector,
+            mappingResolver);
+    this.tableStatisticRefreshScheduler.register();
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            OpenSearchSettings.TABLE_STATISTICS_ENABLED_SETTING,
+            v -> this.tableStatisticRefreshScheduler.onEnabledChanged());
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            OpenSearchSettings.TABLE_STATISTICS_REFRESH_INTERVAL_SETTING,
+            v -> this.tableStatisticRefreshScheduler.onIntervalChanged());
+    clusterService
+        .getClusterSettings()
+        .addSettingsUpdateConsumer(
+            OpenSearchSettings.TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT_SETTING,
+            v -> this.tableStatisticRefreshScheduler.onMaxInFlightChanged(v));
     this.dataSourceService = createDataSourceService();
     dataSourceService.createDataSource(defaultOpenSearchDataSourceMetadata());
     LocalClusterState.state().setClusterService(clusterService);
@@ -330,7 +359,10 @@ public class SQLPlugin extends Plugin
         clusterManagerEventListener,
         pluginSettings,
         directQueryExecutorService,
-        extensionsHolder);
+        extensionsHolder,
+        tableStatisticStorage,
+        tableStatisticCollector,
+        tableStatisticRefreshScheduler);
   }
 
   @Override
