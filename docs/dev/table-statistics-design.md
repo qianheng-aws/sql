@@ -287,10 +287,11 @@ M2 is split into phases by ROI and implementation cost.
 
 #### Phase 3 — Collector quality-of-service
 
-- [ ] **Sampler tuning.** `shard_size = 100 000` is arbitrary. Benchmark + document, or make it a setting.
-- [ ] **Null ratio + top terms.** Slots exist in `FieldStatistic`; collector ignores them. Populate via additional sub-aggs.
-- [ ] **System-index lifecycle.** Currently lazy-created, no version / mapping migration. Needs ISM policy or bootstrap versioning.
-- [ ] **TTL → setting.** Promote hardcoded 24 h to `plugins.calcite.table_statistics.ttl`.
+- [x] **TTL → setting.** Done as part of Phase 2 (`plugins.calcite.table_statistics.ttl`, default 24 h).
+- [x] **Null ratio.** Collected via a top-level `value_count` aggregation: `null_ratio = max(0, 1 − value_count / doc_count)`. Clamp protects against multi-valued fields. `TableStatisticSelectivityHandler` was already consuming `nullRatio`; previously it was always zero.
+- [x] **Sampler shard-size as setting.** `plugins.calcite.table_statistics.sampler_shard_size`, default `100 000`, min `1 000`. Benchmark-guided defaults deferred — keeping the prior value as default means no behaviour change for existing users.
+- [ ] **Top terms.** Slot exists in `FieldStatistic`; no consumer today, so YAGNI. Revisit when M3 #6 (`RareTop` / `top_n` quality) needs it.
+- [ ] **System-index lifecycle.** Currently lazy-created; the `index_name` addition in M2 Phase 2 already demonstrated that existing docs self-heal on next refresh, so no immediate forcing function. Revisit when a breaking mapping change appears.
 
 #### Deferred (not in M2)
 
@@ -328,6 +329,15 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 ## 5. Work log
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
+
+### 2026-04-24 — M2 Phase 3 partial: null_ratio + sampler setting
+
+Two Phase 3 items landed:
+
+- `null_ratio` now computed from a top-level `value_count` aggregation. `TableStatisticSelectivityHandler.IS NULL / IS NOT NULL` finally gets a real selectivity — previously the collector wrote `0.0` and the handler behaved as if no stats existed for null predicates.
+- `shard_size=100 000` in the sampler is now a dynamic setting (`plugins.calcite.table_statistics.sampler_shard_size`). Re-read per aggregation request, no collector rewiring needed.
+
+Two items deferred (see §4): `top_terms` (no consumer, YAGNI until M3 #6), system-index lifecycle / version migration (existing `index_name` rollout proved self-healing is acceptable for now).
 
 ### 2026-04-24 — M2 Phase 2 shipped
 
