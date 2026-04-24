@@ -12,11 +12,14 @@ import java.util.EnumSet;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.opensearch.ExceptionsHelper;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.index.query.QueryBuilders;
 import org.opensearch.search.aggregations.AggregationBuilders;
 import org.opensearch.search.aggregations.Aggregations;
@@ -99,6 +102,8 @@ public class TableStatisticCollector {
           MappingType.Date,
           MappingType.DateNanos);
 
+  private static final ActionListener<Void> NOOP_COMPLETION = ActionListener.wrap(v -> {}, e -> {});
+
   private final NodeClient nodeClient;
   private final TableStatisticStorage storage;
 
@@ -113,6 +118,19 @@ public class TableStatisticCollector {
    * is written when appropriate. Safe to call from any thread.
    */
   public void refreshAsync(String indexName, Map<String, OpenSearchDataType> fieldTypes) {
+    refreshAsync(indexName, fieldTypes, NOOP_COMPLETION);
+  }
+
+  /**
+   * Three-arg variant that additionally invokes {@code completion} exactly once on every terminal
+   * path (success, FAILED-marker write, GENERATING-dedup skip, synchronous throw, rejection skip).
+   * Used by the cron refresher to chain one index's refresh into the next.
+   */
+  public void refreshAsync(
+      String indexName,
+      Map<String, OpenSearchDataType> fieldTypes,
+      ActionListener<Void> completion) {
+    ActionListener<Void> safeCompletion = oneShot(completion, indexName);
     try {
       storage.getRaw(
           indexName,
@@ -121,9 +139,10 @@ public class TableStatisticCollector {
             public void onResponse(Optional<Map<String, Object>> maybeDoc) {
               if (maybeDoc.isPresent() && isFreshGenerating(maybeDoc.get())) {
                 LOG.debug("refresh for {} already in progress; skipping", indexName);
+                safeCompletion.onResponse(null);
                 return;
               }
-              proceedWithCollect(indexName, fieldTypes);
+              proceedWithCollect(indexName, fieldTypes, safeCompletion);
             }
 
             @Override
@@ -133,15 +152,19 @@ public class TableStatisticCollector {
                   "getRaw failed for {}: {}; proceeding with refresh anyway",
                   indexName,
                   e.getMessage());
-              proceedWithCollect(indexName, fieldTypes);
+              proceedWithCollect(indexName, fieldTypes, safeCompletion);
             }
           });
     } catch (RuntimeException e) {
       LOG.warn("refreshAsync for {} threw synchronously: {}", indexName, e.getMessage());
+      safeCompletion.onResponse(null);
     }
   }
 
-  private void proceedWithCollect(String indexName, Map<String, OpenSearchDataType> fieldTypes) {
+  private void proceedWithCollect(
+      String indexName,
+      Map<String, OpenSearchDataType> fieldTypes,
+      ActionListener<Void> completion) {
     // Mark GENERATING (fire-and-forget — log failures at DEBUG).
     storage.putStatus(indexName, TableStatistic.STATUS_GENERATING, noopListener(indexName));
 
@@ -151,6 +174,7 @@ public class TableStatisticCollector {
     } catch (RuntimeException e) {
       LOG.warn("Failed to build aggregation request for {}: {}", indexName, e.getMessage());
       storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+      completion.onResponse(null);
       return;
     }
 
@@ -165,6 +189,7 @@ public class TableStatisticCollector {
             } catch (RuntimeException e) {
               LOG.warn("Failed to parse statistic response for {}: {}", indexName, e.getMessage());
               storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+              completion.onResponse(null);
               return;
             }
             storage.put(
@@ -178,6 +203,7 @@ public class TableStatisticCollector {
                         indexName,
                         stat.getDocCount(),
                         stat.getFields().size());
+                    completion.onResponse(null);
                   }
 
                   @Override
@@ -185,16 +211,51 @@ public class TableStatisticCollector {
                     LOG.warn("Failed to persist statistic for {}: {}", indexName, e.getMessage());
                     storage.putStatus(
                         indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+                    completion.onResponse(null);
                   }
                 });
           }
 
           @Override
           public void onFailure(Exception e) {
+            if (ExceptionsHelper.unwrap(e, OpenSearchRejectedExecutionException.class) != null) {
+              LOG.debug(
+                  "Search rejected for {} (cluster busy); skipping without FAILED marker",
+                  indexName);
+              completion.onResponse(null);
+              return;
+            }
             LOG.warn("Failed to collect statistic for {}: {}", indexName, e.getMessage());
             storage.putStatus(indexName, TableStatistic.STATUS_FAILED, noopListener(indexName));
+            completion.onResponse(null);
           }
         });
+  }
+
+  /**
+   * Wrap {@code inner} so its {@code onResponse} / {@code onFailure} fires at most once regardless
+   * of how many terminal paths invoke it. Treats failure as a completion: callers only need to know
+   * "done" — errors from this async pipeline are already logged by the time we get here.
+   */
+  private static ActionListener<Void> oneShot(ActionListener<Void> inner, String indexName) {
+    AtomicBoolean fired = new AtomicBoolean(false);
+    return new ActionListener<Void>() {
+      @Override
+      public void onResponse(Void v) {
+        if (fired.compareAndSet(false, true)) {
+          try {
+            inner.onResponse(null);
+          } catch (RuntimeException ex) {
+            LOG.warn("completion listener for {} threw: {}", indexName, ex.getMessage());
+          }
+        }
+      }
+
+      @Override
+      public void onFailure(Exception e) {
+        onResponse(null);
+      }
+    };
   }
 
   /**

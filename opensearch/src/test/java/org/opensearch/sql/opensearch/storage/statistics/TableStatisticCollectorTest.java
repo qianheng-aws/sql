@@ -6,11 +6,15 @@
 package org.opensearch.sql.opensearch.storage.statistics;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -22,6 +26,7 @@ import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.lucene.search.TotalHits;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -32,6 +37,7 @@ import org.mockito.junit.jupiter.MockitoExtension;
 import org.opensearch.action.search.SearchRequest;
 import org.opensearch.action.search.SearchResponse;
 import org.opensearch.core.action.ActionListener;
+import org.opensearch.core.concurrency.OpenSearchRejectedExecutionException;
 import org.opensearch.search.SearchHits;
 import org.opensearch.search.aggregations.AggregationBuilder;
 import org.opensearch.search.aggregations.Aggregations;
@@ -417,6 +423,53 @@ class TableStatisticCollectorTest {
     TableStatistic stat = captor.getValue();
     assertEquals(50L, stat.getDocCount());
     assertTrue(stat.getFields().isEmpty(), "no fields supplied → no field statistics");
+  }
+
+  // ---- refreshAsync: 3-arg completion listener ----------------------------
+
+  @Test
+  public void refreshAsyncThreeArgInvokesCompletionOnSuccess() {
+    // Arrange: getRaw returns empty → proceed to search; search returns valid
+    // response; storage.put succeeds.
+    mockGetRaw(Optional.empty());
+    mockPutStatusSuccess();
+    mockSearchSuccess(buildResponse(10L, null));
+    mockPutSuccess();
+
+    AtomicInteger successCount = new AtomicInteger();
+    collector.refreshAsync(
+        "logs-a",
+        Map.of(),
+        ActionListener.wrap(v -> successCount.incrementAndGet(), e -> fail(e.getMessage())));
+
+    assertEquals(1, successCount.get());
+  }
+
+  @Test
+  public void refreshAsyncDoesNotWriteFailedOnRejection() {
+    mockGetRaw(Optional.empty());
+    doAnswer(
+            inv -> {
+              ActionListener<SearchResponse> l = inv.getArgument(1);
+              l.onFailure(new OpenSearchRejectedExecutionException("queue is full"));
+              return null;
+            })
+        .when(nodeClient)
+        .search(any(), any());
+
+    ArgumentCaptor<String> statusCaptor = ArgumentCaptor.forClass(String.class);
+    AtomicInteger completions = new AtomicInteger();
+
+    collector.refreshAsync(
+        "logs-a",
+        Map.of(),
+        ActionListener.wrap(v -> completions.incrementAndGet(), e -> fail(e.getMessage())));
+
+    verify(storage, atLeastOnce()).putStatus(anyString(), statusCaptor.capture(), any());
+    assertFalse(
+        statusCaptor.getAllValues().contains(TableStatistic.STATUS_FAILED),
+        "FAILED must not be written on rejection");
+    assertEquals(1, completions.get());
   }
 
   // ---- helpers ------------------------------------------------------------
