@@ -500,3 +500,48 @@ The `LogicalFilter(row_number ≤ 2)` has already been folded into `EnumerableCa
 **Live impact:** `top N` queries get suboptimal plans because the optimizer thinks they output more rows than they actually will. Downstream physical choices (sort, merge) are over-provisioned. Not a correctness bug — results are correct — just estimate quality.
 
 **Recorded:** 2026-04-24 during demo verification.
+
+### BUG-003: Physical-plan scan rowcount ignores stat-aware selectivity for pushed-down filters
+
+**Priority:** HIGH — this breaks the cost model for any query with a pushdown filter, which is nearly all real PPL queries.
+
+**Reproduction:** `source=demo-events | where status = 'OK'`, stats ON.
+
+**Expected:** the physical `CalciteEnumerableIndexScan` rowcount should match the logical `LogicalFilter` rowcount — both should reflect the stat-aware `Selectivity.Handler` estimate (`2000 × 1/3 ≈ 667`).
+
+**Observed:**
+- Logical plan: `LogicalFilter(status = 'OK'): rowcount = 666.67` ← **correct**, handler fired.
+- Physical plan: `CalciteEnumerableIndexScan(FILTER pushed): rowcount = 300.0` ← **wrong**, `2000 × 0.15` (Calcite's default EQUALS guess).
+
+Same divergence with range filter `latency ∈ [500, 1500]`: logical `1126.88` vs physical `500` (2000 × 0.5 × 0.5).
+
+**Root cause:** `AbstractCalciteIndexScan.estimateRowCount` folds pushdown operations into a running rowcount, and the FILTER / SCRIPT branch uses `RelMdUtil.guessSelectivity` directly:
+
+```java
+case FILTER, SCRIPT ->
+    NumberUtil.multiply(
+        rowCount,
+        RelMdUtil.guessSelectivity(
+            ((FilterDigest) operation.digest()).condition()));
+```
+
+This bypasses the `TableStatisticSelectivityHandler` entirely. The stat-aware selectivity is only consumed in the logical phase via `RelMdSelectivity.getSelectivity(LogicalFilter, ...)` → `unwrap(Selectivity.Handler.class)`. Once the filter has been pushed into the scan, the plan reduction inside `estimateRowCount` makes its own decisions.
+
+**Live impact:** every query with a pushable filter — i.e. equality, range, null — gets a wrong physical-plan scan rowcount. Cost comparisons between candidate physical plans (push-vs-no-push, HashJoin-vs-MergeJoin, etc.) use the physical rowcount, so a miss here propagates into plan selection.
+
+The §7 "join reorder" demo still works because the join optimizer consults `RelMetadataQuery.getRowCount` which ultimately calls `AbstractCalciteIndexScan.estimateRowCount` — and even with `guessSelectivity`, 50 vs 2000 is different enough that the commute still picks the right side. But finer-grained choices (e.g. whether to filter before or after a join, or pick between two index access paths) would flip with the wrong number.
+
+**Proper fix (future):** inside `estimateRowCount`'s FILTER branch, do what `RelMdSelectivity.getSelectivity` does — try `unwrap(Selectivity.Handler.class)` first, fall back to `guessSelectivity` only when no handler is available. Concretely:
+
+```java
+case FILTER, SCRIPT -> {
+    RexNode cond = ((FilterDigest) operation.digest()).condition();
+    BuiltInMetadata.Selectivity.Handler h = table.unwrap(BuiltInMetadata.Selectivity.Handler.class);
+    double sel = h != null ? h.getSelectivity(this, mq, cond) : RelMdUtil.guessSelectivity(cond);
+    yield NumberUtil.multiply(rowCount, sel);
+}
+```
+
+**Unit test gap:** `CalciteIndexScanCostTest.test_cost_on_filter_pushdown` hard-codes the expected result as `2000 × 0.15 = 300` — it asserts the *current* behavior, which is the buggy one. The test would need updating along with the fix.
+
+**Recorded:** 2026-04-24 during demo verification (logical vs physical divergence spotted by reviewer question).
