@@ -49,6 +49,7 @@ public abstract class Settings {
     TABLE_STATISTICS_TTL("plugins.calcite.table_statistics.ttl"),
     TABLE_STATISTICS_REFRESH_MAX_IN_FLIGHT(
         "plugins.calcite.table_statistics.refresh_max_in_flight"),
+    TABLE_STATISTICS_SAMPLER_SHARD_SIZE("plugins.calcite.table_statistics.sampler_shard_size"),
 
     /** Query Settings. */
     FIELD_TYPE_TOLERANCE("plugins.query.field_type_tolerance"),

@@ -281,7 +281,13 @@ public class SQLPlugin extends Plugin
     // OpenSearchPluginModule's @Provides methods use the same instances.
     this.tableStatisticStorage = new TableStatisticStorage(this.client);
     this.tableStatisticCollector =
-        new TableStatisticCollector(this.client, this.tableStatisticStorage);
+        new TableStatisticCollector(
+            this.client,
+            this.tableStatisticStorage,
+            () ->
+                pluginSettings.getSettingValue(
+                    org.opensearch.sql.common.setting.Settings.Key
+                        .TABLE_STATISTICS_SAMPLER_SHARD_SIZE));
     TableStatisticsMappingResolver mappingResolver =
         new TableStatisticsMappingResolver(this.client);
     this.tableStatisticRefreshScheduler =

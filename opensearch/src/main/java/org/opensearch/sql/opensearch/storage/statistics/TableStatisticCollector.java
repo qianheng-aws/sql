@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.IntSupplier;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.ExceptionsHelper;
@@ -46,7 +47,7 @@ import org.opensearch.transport.client.node.NodeClient;
  * <ul>
  *   <li>Cardinality (HLL, approximate distinct count) is wrapped in a {@link
  *       SamplerAggregationBuilder sampler} so per-shard work is bounded by {@link
- *       #SAMPLER_SHARD_SIZE} documents.
+ *       #DEFAULT_SAMPLER_SHARD_SIZE sampler-shard-size} documents.
  *   <li>Min / max are <b>top-level</b> aggregations (not under the sampler). Lucene's {@code
  *       MinAggregator} / {@code MaxAggregator} short-circuit to {@code
  *       PointValues.getMinPackedValue} / {@code getMaxPackedValue} on numeric / date fields, so
@@ -64,8 +65,8 @@ public class TableStatisticCollector {
 
   private static final Logger LOG = LogManager.getLogger(TableStatisticCollector.class);
 
-  /** Sampler aggregation shard-size: cap documents seen per shard to bound memory. */
-  private static final int SAMPLER_SHARD_SIZE = 100_000;
+  /** Default sampler shard-size when no supplier is wired (kept for test convenience). */
+  static final int DEFAULT_SAMPLER_SHARD_SIZE = 100_000;
 
   /** If a GENERATING marker is older than this, treat it as abandoned and re-issue a collect. */
   private static final Duration STALE_GENERATING = Duration.ofMinutes(10);
@@ -108,10 +109,25 @@ public class TableStatisticCollector {
 
   private final NodeClient nodeClient;
   private final TableStatisticStorage storage;
+  private final IntSupplier samplerShardSize;
 
+  /**
+   * Construct with a fixed sampler shard-size ({@value #DEFAULT_SAMPLER_SHARD_SIZE}). Used by tests
+   * and as a fallback when no settings source is wired.
+   */
   public TableStatisticCollector(NodeClient nodeClient, TableStatisticStorage storage) {
+    this(nodeClient, storage, () -> DEFAULT_SAMPLER_SHARD_SIZE);
+  }
+
+  /**
+   * Construct with a supplier that re-reads the live {@code sampler_shard_size} setting on every
+   * aggregation request. Dynamic setting updates take effect on the next refresh.
+   */
+  public TableStatisticCollector(
+      NodeClient nodeClient, TableStatisticStorage storage, IntSupplier samplerShardSize) {
     this.nodeClient = nodeClient;
     this.storage = storage;
+    this.samplerShardSize = samplerShardSize;
   }
 
   /**
@@ -292,7 +308,7 @@ public class TableStatisticCollector {
     Map<String, OpenSearchDataType> flat = OpenSearchDataType.traverseAndFlatten(fieldTypes);
 
     SamplerAggregationBuilder samplerAgg =
-        AggregationBuilders.sampler(SAMPLER_AGG).shardSize(SAMPLER_SHARD_SIZE);
+        AggregationBuilders.sampler(SAMPLER_AGG).shardSize(samplerShardSize.getAsInt());
 
     SearchSourceBuilder source =
         new SearchSourceBuilder().query(QueryBuilders.matchAllQuery()).size(0).trackTotalHits(true);
