@@ -181,6 +181,12 @@ The original plan was to read `STATISTICAL_DATA` from ml-commons' Index Insight.
 
 Beyond the triggers, the coupling direction was wrong: statistics are fuel for the query optimizer, so the consumer shouldn't depend on an unrelated producer. Owning the collector in-plugin removes the classloader boundary, lets `FieldStatistic` evolve alongside the Calcite hook, and decouples our release cadence from ml-commons'. The cost is ~1k LOC of sampler + persistence code we now maintain, plus a system index to lifecycle-manage. In POC phase, control beats reuse.
 
+Even if the classloader and Guava issues were fixable, ml-commons' `StatisticalDataTask` is shaped for a different consumer (LLM-facing index profiling, not CBO), so its output would be wrong for our use case on three axes:
+
+- **Precision.** ml-commons wraps *every* aggregation (including `min`/`max`) inside a single `sampler(shardSize=100_000)`, so numeric/date extrema are sample-bounded. Our collector keeps `min`/`max` as top-level aggregations (BKD short-circuit, exact global extrema — see §2.3) and only puts `cardinality` under the sampler. Same goes for `doc_count`: we read it from `trackTotalHits`, ml-commons reads it from the sampler's doc count.
+- **Scope.** ml-commons additionally collects `top_hits(size=3)` example docs, `terms(size=5)` top values, and — when the field count exceeds 30 — calls an LLM agent (`os_index_insight_agent`) to pick "important" columns. That machinery exists to build a prompt-ready index snapshot; Calcite only needs `cardinality / min / max / null_ratio`, and it needs them for every eligible field, not a LLM-filtered subset. Routing CBO stats through an LLM is the most visible symptom of the "coupling direction wrong" argument above.
+- **Freshness / API surface.** ml-commons exposes a transport action gated by `plugins.ml_commons.index_insight_feature_enabled`, per-tenant config, and a configured LLM agent — none guaranteed in a SQL-plugin deployment. Our path is a local in-plugin call with a 500 ms latch and fire-and-forget refresh, no external prerequisites.
+
 ### 3.2 Store `unique_count` only, not the HLL sketch
 
 The sampler's `cardinality` agg is HLL++ under the hood and the internal sketch is serializable, so in principle we could persist the sketch bytes and `merge(HLL(A), HLL(B))` later — that's the ClickHouse `uniq` pattern. Today we store only the final `unique_count` long.
