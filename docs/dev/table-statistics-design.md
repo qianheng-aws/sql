@@ -330,6 +330,37 @@ These were captured in the POC plan's "Consumer-side Future Work" section. #2 an
 
 Narrative only — per-commit history is on the `table-statistics` branch (`git log --oneline`). Entries here capture decisions, measurements, and pivots that don't fit in a commit message.
 
+### 2026-04-27 — design doc reconciled with BUG-003 fix iteration + BUG-004 added
+
+The earlier "UPDATE 2026-04-24: BUG-003 fixed" block claimed `computeSelfCost` had been
+converted to stat-aware. That's no longer true: the aggregate fix went through three
+iterations (stat-aware everywhere → reverted → stat-aware only in `estimateRowCount` via
+pre-agg TableScan routing), and `computeSelfCost` intentionally stayed on Calcite defaults.
+Replaced the stale block with an accurate "final form after regression detour" narrative and
+added BUG-004 as the root-cause entry explaining why the asymmetry exists — scan self-cost
+conflates all pushdown-op costs into one number, so a correctness improvement on rowcount
+cascades into a ~25× cost swing that distorts VolcanoPlanner's importance-based rule-firing.
+
+### 2026-04-24 — Demo walkthrough uncovered 3 bugs + 1 regression
+
+Live-ran the demo script end-to-end on a fresh cluster. Four real issues surfaced that unit
+tests had missed:
+
+- **BUG-001** — concurrent `/analyze` race (GENERATING overwrites COMPLETED because both writes
+  are fire-and-forget).
+- **BUG-002** — `RareTopPushdownRule` doesn't match the physical plan shape PPL `top N`
+  actually produces (EnumerableCalc eats the Filter).
+- **BUG-003** — pushed-down filter rowcount ignored `Selectivity.Handler`; wrote a fix, then
+  discovered the same class of issue hid in the aggregate branch.
+- **Regression from BUG-003 Attempt 1** — naïve stat-aware `computeSelfCost` changes collapsed
+  scan cost so far that VolcanoPlanner stopped firing `ProjectIndexScanRule`, and fully-pushed
+  plans regressed to partial-pushdown. Rolled forward through two more iterations to reach the
+  current asymmetric design; recorded as BUG-004.
+
+Key takeaway, recorded for posterity: unit tests verify code correctness, live-cluster demo
+verifies feature correctness. Four bugs caught in one 2-hour session that had been invisible
+through unit tests and IT. Demo script now includes real numbers + known-issues appendix.
+
 ### 2026-04-24 — M4 productionization
 
 Four of five M4 items landed in a single pass, one explicitly deferred:
@@ -546,27 +577,94 @@ case FILTER, SCRIPT -> {
 
 **Recorded:** 2026-04-24 during demo verification (logical vs physical divergence spotted by reviewer question).
 
-### UPDATE 2026-04-24: BUG-003 fixed; same class of issue was present in the AGGREGATION branch too
+### UPDATE 2026-04-27: BUG-003 resolution (final form after regression detour)
 
-`AbstractCalciteIndexScan.estimateRowCount` and `.computeSelfCost` now consult
-`Selectivity.Handler` / `DistinctRowCount.Handler` directly via `getTable().unwrap(...)` on the
-scan itself, falling back to the prior heuristic (`RelMdUtil.guessSelectivity`, `inputRowCount /
-10`) only when no handler is wired.
+The fix for BUG-003 evolved over several iterations; the final form (commits `7466f0a62` →
+`5c424709c` → `dd603cc76`) is described below. The intermediate states are documented because
+reading the commit history alone is confusing.
 
-The aggregate branch had been overlooked — we delegated to `mq.getRowCount((Aggregate)
-operation.digest())`, which in turn calls `mq.getDistinctRowCount(aggregate.getInput(), ...)`.
-During physical planning `aggregate.getInput()` is a `RelSubset`, so Calcite's routing
-skips our handler and falls back to `inputRowCount / 10`. By consulting the handler on `this`
-scan directly we bypass the subset entirely.
+**Attempt 1 (commit `7466f0a62`, reverted).** Naïve stat-aware rewrite of *both* branches in
+`estimateRowCount` *and* `computeSelfCost` — call `getTable().unwrap(Handler.class)` on `this`
+scan, fall back to guess/`mq.getRowCount` otherwise. Works for the filter case but **breaks
+project pushdown for aggregate queries**. Root cause surfaced later as BUG-004.
 
-Live verification on `demo-events`:
-- `where status = 'OK'`: logical 666.67, physical scan (filter pushed) **666.67** — matched.
-- `stats count() by status, region`: logical 9.0, physical scan (agg pushed) **9.0** — matched.
+**Attempt 2 (commit `5c424709c`, "revert aggregate").** Keep the stat-aware filter fix, but
+revert the aggregate branch and `computeSelfCost` changes. Project pushdown restored, aggregate
+physical-scan rowcount still wrong (200 instead of 9) but considered cosmetic because the logical
+plan still shows the correct `9.0` and metadata consumers (join reorder etc.) go through that
+path.
 
-New unit tests (`test_filter_pushdown_uses_stat_aware_selectivity_when_handler_available`,
-`test_aggregate_pushdown_uses_distinct_row_count_handler_when_available`) lock in the
-invariant that the handler is reachable from the scan's own rowcount logic, not only from the
-logical-plan `RelMd*` dispatch.
+**Attempt 3 (commit `dd603cc76`, current).** Stat-aware aggregate rowcount via pre-agg
+`TableScan` routing (see PRE_AGG_TABLESCAN_ROUTING pattern). `computeSelfCost` still uses
+Calcite's default `mq.getRowCount(digest)` intentionally — asymmetric with `estimateRowCount`.
+See BUG-004 below for why the asymmetry exists.
+
+**Current behaviour on `demo-events`:**
+
+| Query | Logical | Physical scan rowcount | Plan shape |
+|---|---|---|---|
+| `where status = 'OK'` | 666.67 | **666.67** ✅ | full FILTER + PROJECT + LIMIT pushdown |
+| `stats count() by status, region` | 9.0 | **9.0** ✅ | full AGGREGATION + PROJECT + LIMIT pushdown |
+
+The `where status = 'OK'` case uses `selectivityFromHandlerOrGuess` in the FILTER branch.
+The aggregate case uses `aggregationRowCount` + `findTableScan(aggregate.getInput())` to reach
+the pre-agg `TableScan` (groupKey indexes into the pre-agg row type, which is distinct from
+`this.getRowType()` once project pushdown reshapes the scan's output).
+
+`computeSelfCost` kept on Calcite defaults, producing e.g. `cumulative cost = 739.8` instead
+of `~30` — see BUG-004 for rationale.
+
+Unit tests: the filter-pushdown stat-aware test (`test_filter_pushdown_uses_stat_aware_
+selectivity_when_handler_available`) is live. The equivalent aggregate test was removed during
+Attempt 2 because constructing the right `RelSubset` in a unit test is prohibitive; live-cluster
+verification and the demo script cover the aggregate path instead.
+
+### BUG-004: Scan self-cost folds pushdown-op costs into one number, distorting VolcanoPlanner rule firing
+
+**Priority:** HIGH in principle, DEFERRED in practice.
+
+**Observation trail.** While fixing BUG-003 (Attempt 1) we introduced a regression: with
+stat-aware aggregate rowcount (9) instead of the Calcite-default fallback (200), the full-push
+plan (`AGG + PROJECT + LIMIT` in one scan) was no longer selected; VolcanoPlanner picked a
+partial-push plan (`EnumerableCalc + Scan` with only `AGGREGATION` pushed) instead.
+
+**Diagnosis.** Hand-computed costs for the two candidate plans after the fix:
+
+| Plan | `computeSelfCost` output (cumulative rows) |
+|---|---|
+| A. Full-push Scan[AGG + PROJECT + LIMIT] | **~30.7** |
+| B. Calc(reshape) + Scan[AGG + LIMIT]     | **~39.7** (30.7 scan + 9 calc) |
+
+Plan A is cheaper, yet VolcanoPlanner **picks Plan B**. Reason: once Plan B's representative is
+in the memo with cost ~40, the equivalence class's **importance** (roughly `1 / current_best_
+cost`) drops, and `ProjectIndexScanRule` — which would have rewritten Plan A into a cheaper
+fully-pushed form — never fires. Importance-based rule firing is a heuristic, not exhaustive
+enumeration.
+
+**Why the bug only appeared after the fix.** Pre-fix the scan self-cost for Plan A was `~740`
+(because `mq.getRowCount` returned 200 for the aggregate, and `dCpu += dRows * fields`
+accumulates). With cost ~740, the equivalence class had enough importance that
+`ProjectIndexScanRule` fired and Plan A got rewritten to its cheaper fully-pushed form.
+Stat-aware rowcount (9) drops the cost ~25× all at once, pushing the importance below threshold.
+
+**Root cause.** `AbstractCalciteIndexScan.computeSelfCost` folds *every* pushdown operation's
+cost into the single `self cost` of the scan node (via the `dCpu += ...` accumulation + the
+external cost `dRows × fields`). A correctness improvement on one dimension (rowcount) cascades
+into a ~25× scan self-cost swing, which distorts rule-firing heuristics elsewhere.
+
+**Contrast with standard Calcite.** In mainline Calcite each pushdown op is a distinct
+`RelNode` with its own cost; a scan's self cost is basically a constant table-read. Rowcount
+changes affect downstream nodes, not the scan's own cost. Rule-firing heuristics stay stable.
+
+**Current workaround (commit `dd603cc76`).** Diverge `estimateRowCount` (stat-aware, correct)
+and `computeSelfCost` (Calcite default, stable). Metadata consumers get correct numbers;
+plan selection stays on pre-fix cost curves. TODO comments in both method javadocs point back
+to this section.
+
+**Proper fix (deferred).** Redesign scan self-cost so pushed-down ops contribute cost without
+being amplified by external-operator cost formulas — likely make `computeSelfCost` return a
+small constant and move the pushdown-op contributions into a child-cost model that Calcite
+accumulates naturally. Not blocking M1-M4 functionality; defer to a dedicated cleanup PR.
 
 ### Design note: why a local `unwrap` on `this` scan instead of a custom `RelMetadataProvider`?
 
