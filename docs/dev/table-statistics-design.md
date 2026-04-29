@@ -11,6 +11,13 @@ Apache Calcite's cost-based optimizer needs per-table and per-column statistics 
 - `OpenSearchIndex.getStatistic()` returns `Statistics.UNKNOWN` → cost falls back to `maxResultWindow = 10 000` regardless of actual index size.
 - `RelMdRowCount.getRowCount(Aggregate)` falls back to `inputRowCount / 10` when no `DistinctRowCount` handler is present → `stats count() by status` on a 137-doc/5-value index estimates `13.7` rows instead of `5`.
 - Join reorder, filter pushdown ordering, and limit placement all make worse choices.
+- Persistent value for future integration with MPP engine or other OLAP engine：
+    - Algorithm selection — e.g. heap-based Top-K instead of full sort; hash-set vs HLL for distinct; HashJoin vs MergeJoin.
+    - Broadcast vs shuffle join
+    - Partition pruning from min/max — skip reading files entirely, not "read then filter".
+    - Predicate reordering — run cheap+selective filters before expensive ones.
+
+
 
 We need a statistics subsystem that (a) collects field-level stats asynchronously, (b) persists them durably, (c) serves them to Calcite with sub-millisecond latency during planning.
 

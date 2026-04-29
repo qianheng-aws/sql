@@ -11,6 +11,24 @@ Walk-through script for showing how stored statistics affect Calcite's plan on a
 
 The real numbers below were produced on a live cluster 2026-04-24 — if your re-run differs by a fraction, it's likely because the HLL cardinality is approximate (e.g. `status.unique_count = 3` exactly, `latency.unique_count` near 1250 with slight sampling variance).
 
+## Real output summary
+
+All numbers from a single live-cluster pass on 2026-04-24. Section 7 is the most visually striking (algorithm + order swap); sections 5a, 5b, and 8 are the most numerically striking.
+
+| § | Feature | OFF | ON | Accuracy Ratio |
+|---|---|---|---|---|
+| 1 | TableScan rowcount | 10000 | 2000 | 5× |
+| 2 | `= 'OK'` | 1500 | 666.67 | 2.25× |
+| 3 | `BETWEEN 500 AND 1500` | 2500 | 1126.88 | 2.2× |
+| 4 | `IS NOT NULL` | 9000 | 2000 | 4.5× |
+| 5a | `by status` | 1000 | **3** | 333× |
+| 5b | `by status, region` | 1000 | **9** | 111× |
+| 7 | join cumulative cost | 1.51E7 | 2.45E4 | **~600×** |
+| 8 | join rowcount (compound) | 1 125 000 | **1248** | **~900×** |
+| 8' | aggregate rowcount (compound) | 112500 | **3** | ~37 500× |
+
+*Note: No runtime performance improvements on Calcite’s enumerable engine since it’s in-memory coordinator-side execution; Will be essential to distributed MPP engines (Trino, Doris)and any future Velox-backed execution.*
+
 ---
 
 ## 0. Setup — two indices that exercise every hook
@@ -410,22 +428,3 @@ done
 
 ---
 
-## Appendix — real output summary
-
-All numbers from a single live-cluster pass on 2026-04-24. Section 7 is the most visually striking (algorithm + order swap); sections 5a, 5b, and 8 are the most numerically striking.
-
-| § | Feature | OFF | ON | Ratio |
-|---|---|---|---|---|
-| 1 | TableScan rowcount | 10000 | 2000 | 5× |
-| 2 | `= 'OK'` | 1500 | 666.67 | 2.25× |
-| 3 | `BETWEEN 500 AND 1500` | 2500 | 1126.88 | 2.2× |
-| 4 | `IS NOT NULL` | 9000 | 2000 | 4.5× |
-| 5a | `by status` | 1000 | **3** | 333× |
-| 5b | `by status, region` | 1000 | **9** | 111× |
-| 7 | join cumulative cost | 1.51E7 | 2.45E4 | **~600×** |
-| 8 | join rowcount (compound) | 1 125 000 | **1248** | **~900×** |
-| 8' | aggregate rowcount (compound) | 112500 | **3** | ~37 500× |
-
-## Appendix — known issue uncovered during demo rehearsal
-
-**BUG-001 — concurrent `/analyze` can leave status=GENERATING** — if `/analyze` is issued on two indices *in parallel* against a cluster where `.opensearch-statistics` hasn't been created yet, `putStatus(GENERATING)` and `put(COMPLETED)` are both fire-and-forget, and the GENERATING write can sometimes land after COMPLETED (overwriting it). The cron refresh path is unaffected (serialized through the semaphore). Run `/analyze` serially, pre-create the system index, or rely on cron. Recorded in design doc §6 with the deferred fix (seq-numbered writes).
